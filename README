@@ -1,4 +1,4 @@
-	ash, a terminal AI agent
+    ash, a terminal AI agent
 
 An AI agent takes a request in plain language, hands it to a model, and
 the model works your tree with tools: shell, read, write, edit, grep.
@@ -9,10 +9,10 @@ but we're too young to remember that anyway.
 
 Two ideas:
 
-The agent loop drives model and tools and emits a typed event
+* The agent loop drives model and tools and emits a typed event
 stream. The TUI is one consumer, --rpc is another.
 
-The framebuffer is the single writer to your tty. Widgets render into
+* The framebuffer is the single writer to your tty. Widgets render into
 cells, frames get diffed, the diff goes out as minimal VT. The mouse
 wheel scrolls the transcript, why the prompt gives multiline editing,
 clipboard, undo, and a selection across a soft-wrapped line copies
