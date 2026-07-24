@@ -1,0 +1,15 @@
+ash-fb 24x8
+cursor: hidden
+0 | hello.c   +1 -1        | 0:24A
+1 | 1 one                  | 0:24-
+2 |-2 two                  | 0:24B
+3 |+2 TWO                  | 0:24C
+4 | 3 three                | 0:24-
+5 | 4 four                 | 0:24-
+6 | 5 five                 | 0:24-
+7 | [A]ccept  [E]dit  [R]ej| 0:24D
+legend:
+ A fg=ffffff bg=204080 none
+ B fg=d03030 bg=default none
+ C fg=20a020 bg=default none
+ D fg=c0c0c0 bg=default bold

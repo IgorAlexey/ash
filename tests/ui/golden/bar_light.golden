@@ -1,0 +1,10 @@
+ash-fb 20x5
+cursor: 12,1 bar
+0 |────────────────────| 0:20A
+1 | hello world        | 0:20B
+2 |                    | 0:20B
+3 |                    | 0:20B
+4 |────────────────────| 0:20A
+legend:
+ A fg=808080 bg=fafafa none
+ B fg=1e1e1e bg=fafafa none

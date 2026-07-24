@@ -1,0 +1,3 @@
+# an old extension with no api field
+name = oldext
+entry = old.so

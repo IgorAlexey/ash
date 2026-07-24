@@ -1,0 +1,7 @@
+ash-fb 12x3
+cursor: 4,2 bar
+0 |5 a5        | 0:2A 2:10-
+1 |6 a6        | 0:2A 2:10-
+2 |7 a7        | 0:2A 2:10-
+legend:
+ A fg=default bg=default italic

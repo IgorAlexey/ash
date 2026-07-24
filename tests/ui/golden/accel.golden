@@ -1,0 +1,5 @@
+ash-fb 12x1
+cursor: hidden
+0 |[Save]      | 0:1- 1:1A 2:10-
+legend:
+ A fg=default bg=default underline

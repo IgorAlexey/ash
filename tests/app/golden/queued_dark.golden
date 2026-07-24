@@ -1,0 +1,8 @@
+ash-fb 24x3
+cursor: hidden
+0 |> first queued message  | 0:2A 2:20B 22:2-
+1 |> second one is quite a | 0:2A 2:22B
+2 |> third                 | 0:2A 2:5B 7:17-
+legend:
+ A fg=969696 bg=default none
+ B fg=969696 bg=default 

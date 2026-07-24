@@ -1,0 +1,6 @@
+ash-fb 40x1
+cursor: hidden
+0 | File  View  Help                       | 0:1A 1:1B 2:5A 7:1B 8:5A 13:1B 14:26A
+legend:
+ A fg=141414 bg=c8c8c8 none
+ B fg=141414 bg=c8c8c8 underline

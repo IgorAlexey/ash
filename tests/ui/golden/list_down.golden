@@ -1,0 +1,7 @@
+ash-fb 12x3
+cursor: hidden
+0 |  alpha     | 0:12-
+1 |> beta      | 0:12A
+2 |  gamma     | 0:12-
+legend:
+ A fg=default bg=default reverse

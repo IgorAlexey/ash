@@ -1,0 +1,9 @@
+ash-fb 20x5
+cursor: 2,0 bar
+0 |1 line one          | 0:2A 2:18-
+1 |2 line two          | 0:2A 2:18-
+2 |3 three             | 0:2A 2:18-
+3 |                    | 0:20-
+4 |                    | 0:20-
+legend:
+ A fg=default bg=default italic

@@ -1,0 +1,19 @@
+ash-fb 40x10
+cursor: hidden
+0 | File  View  Help                       | 0:1A 1:1B 2:4A 6:1C 7:1D 8:4C 12:1A 13:1B 14:26A
+1 |      ┌────────────────────┐            | 0:6- 6:22E 28:12-
+2 |      │ * Word Wrap  Alt+Z │            | 0:6- 6:1E 7:3C 10:1D 11:16C 27:1E 28:12-
+3 |      │   Line Numbers     │            | 0:6- 6:4E 10:1F 11:17E 28:12-
+4 |      └────────────────────┘            | 0:6- 6:22E 28:12-
+5 |                                        | 0:40-
+6 |                                        | 0:40-
+7 |                                        | 0:40-
+8 |                                        | 0:40-
+9 |                                        | 0:40-
+legend:
+ A fg=141414 bg=c8c8c8 none
+ B fg=141414 bg=c8c8c8 underline
+ C fg=ffffff bg=007800 none
+ D fg=ffffff bg=007800 underline
+ E fg=141414 bg=dcdcdc none
+ F fg=141414 bg=dcdcdc underline

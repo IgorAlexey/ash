@@ -1,0 +1,8 @@
+ash-fb 16x3
+cursor: 5,1 bar
+0 |1 select me     | 0:2A 2:3- 5:6B 11:5-
+1 |2 and this      | 0:2A 2:3B 5:11-
+2 |                | 0:16-
+legend:
+ A fg=default bg=default italic
+ B fg=101010 bg=4080f0 none

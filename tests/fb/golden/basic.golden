@@ -1,0 +1,9 @@
+ash-fb 16x4
+cursor: 5,0 bar
+0 |Hello           | 0:5A 5:11-
+1 |world           | 0:16-
+2 |                | 0:16-
+3 | status         | 0:16B
+legend:
+ A fg=e74c3c bg=default bold
+ B fg=ffffff bg=2060c0 underline

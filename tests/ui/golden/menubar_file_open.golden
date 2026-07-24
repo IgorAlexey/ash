@@ -1,0 +1,19 @@
+ash-fb 40x10
+cursor: hidden
+0 | File  View  Help                       | 0:1A 1:1B 2:4A 6:1C 7:1D 8:5C 13:1D 14:26C
+1 |┌──────────────┐                        | 0:16E 16:24-
+2 |│ New   Ctrl+N │                        | 0:1E 1:1A 2:1B 3:12A 15:1E 16:24-
+3 |│ Open  Ctrl+O │                        | 0:2E 2:1F 3:13E 16:24-
+4 |│ Save  Ctrl+S │                        | 0:2E 2:1F 3:13E 16:24-
+5 |│──────────────│                        | 0:16E 16:24-
+6 |│ Exit  Ctrl+Q │                        | 0:3E 3:1F 4:12E 16:24-
+7 |└──────────────┘                        | 0:16E 16:24-
+8 |                                        | 0:40-
+9 |                                        | 0:40-
+legend:
+ A fg=ffffff bg=007800 none
+ B fg=ffffff bg=007800 underline
+ C fg=141414 bg=c8c8c8 none
+ D fg=141414 bg=c8c8c8 underline
+ E fg=141414 bg=dcdcdc none
+ F fg=141414 bg=dcdcdc underline

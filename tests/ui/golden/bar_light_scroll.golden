@@ -1,0 +1,10 @@
+ash-fb 20x5
+cursor: 1,3 bar
+0 |─── ↑ 2 more ───────| 0:20A
+1 | l3                 | 0:20B
+2 | l4                 | 0:20B
+3 | l5                 | 0:20B
+4 |─── ↓ 4 more ───────| 0:20A
+legend:
+ A fg=808080 bg=fafafa none
+ B fg=1e1e1e bg=fafafa none

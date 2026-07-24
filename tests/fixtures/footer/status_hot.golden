@@ -1,0 +1,7 @@
+ash-fb 80x1
+cursor: hidden
+0 | anthropic · claude-sonnet-4  ↑12k ↓3.4k  $0.123  192k/200k     96%       (main)| 0:30- 30:1A 31:4- 35:1A 36:6- 42:6B 48:12- 60:12C 72:2- 74:6B
+legend:
+ A fg=888888 bg=default none
+ B fg=3fb950 bg=default none
+ C fg=000000 bg=e74c3c none

@@ -1,0 +1,3 @@
+name = frobnicator
+api_version = 999
+entry = frob.so

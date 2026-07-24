@@ -1,0 +1,18 @@
+ash-fb 44x14
+cursor: hidden
+0 |                                            | 0:44-
+1 |                                            | 0:44-
+2 |                                            | 0:44-
+3 |   ┌─ Settings ─────────────────────────┐   | 0:44-
+4 |   │> Provider: anthropic               │   | 0:4- 4:36A 40:4-
+5 |   │  Model: m1                         │   | 0:44-
+6 |   │  Thinking: off                     │   | 0:44-
+7 |   │[☐ Project scope]                   │   | 0:44-
+8 |   │Enter change   Tab scope   Esc close│   | 0:44-
+9 |   └────────────────────────────────────┘   | 0:44-
+10 |                                            | 0:44-
+11 |                                            | 0:44-
+12 |                                            | 0:44-
+13 |                                            | 0:44-
+legend:
+ A fg=default bg=default reverse

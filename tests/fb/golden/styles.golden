@@ -1,0 +1,7 @@
+ash-fb 12x2
+cursor: hidden
+0 |bold rev    | 0:4A 4:1- 5:3B 8:4-
+1 |plain       | 0:12-
+legend:
+ A fg=e74c3c bg=default bold
+ B fg=101010 bg=d0d0d0 reverse,strike
