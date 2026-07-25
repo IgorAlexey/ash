@@ -404,6 +404,24 @@ static void serve_hold(int lfd)
     close(c);
 }
 
+static void serve_reset(int lfd)
+{
+    int c = accept(lfd, NULL, NULL);
+    if (c < 0)
+        return;
+    read_request(c);
+    const char *hdr =
+        "HTTP/1.1 200 OK\r\n"
+        "Content-Type: text/event-stream\r\n"
+        "Content-Length: 65536\r\n"
+        "Connection: close\r\n\r\n";
+    write_all(c, hdr, strlen(hdr));
+    write_all(c, HOLD_PREFIX, strlen(HOLD_PREFIX));
+    struct linger lg = { 1, 0 };
+    (void)setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(c);
+}
+
 static void run_loop(const char *url, int in_fd, char *out, size_t cap)
 {
     int outfd = memfd_create("loop-out", 0);
@@ -869,6 +887,36 @@ static void test_paste_mark_split(void)
 
     ASH_CHECK(strstr(out, "PASTE") != NULL);
     ASH_CHECK(strstr(out, "bye") != NULL);
+}
+
+static void test_transport_error(void)
+{
+    int port;
+    int lfd = listen_loopback(&port);
+    ASH_CHECK(lfd >= 0);
+    pid_t pid = fork();
+    ASH_CHECK(pid >= 0);
+    if (pid == 0) {
+        serve_reset(lfd);
+        close(lfd);
+        _exit(0);
+    }
+    close(lfd);
+
+    int inp[2];
+    ASH_CHECK(pipe(inp) == 0);
+    write_all(inp[1], "hello\r", 6);
+    close(inp[1]);
+
+    char url[64], out[8192];
+    (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+    run_loop(url, inp[0], out, sizeof out);
+    close(inp[0]);
+
+    ASH_CHECK(strstr(out, "error:") != NULL);
+    ASH_CHECK(strstr(out, "transfer failed") != NULL);
+    ASH_CHECK(strstr(out, "http status 0") == NULL);
+    (void)waitpid(pid, NULL, 0);
 }
 
 static void test_split_escape(void)
@@ -1642,6 +1690,7 @@ int main(void)
     test_submit_then_eof_one_write();
     test_two_submits_one_write();
     test_paste_mark_split();
+    test_transport_error();
     test_split_escape();
     test_tool();
     test_tool_multi();

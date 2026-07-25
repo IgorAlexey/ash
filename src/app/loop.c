@@ -102,6 +102,7 @@ struct ash_loop {
 
     ash_provider_stream *stream;
     int              running;
+    char             stream_err[ASH_ERRBUF_CAP];
 
     ash_proc        *proc;
     ash_buf         *tool_out;
@@ -831,7 +832,8 @@ static void loop_emit(void *ud, const ash_agent_event *ev)
         log_msg(L, ev->msg);
         return;
     case ASH_AGENT_ERROR:
-        report_error(L, ev->text);
+        report_error(L, L->stream_err[0] ? L->stream_err : ev->text);
+        L->stream_err[0] = 0;
         return;
     case ASH_AGENT_TOOL_START:
     case ASH_AGENT_TOOL_END:
@@ -846,6 +848,7 @@ static int loop_pump(void *ud, ash_provider_stream *s)
     int canceled = 0;
     L->stream = s;
     L->running = 1;
+    L->stream_err[0] = 0;
     while (L->running) {
         ash_co_yield(&L->co, ASH_WAIT_SSE);
         if (in_pending(L) && busy_input(L)) {
@@ -1470,8 +1473,10 @@ static ash_status loop_run(struct ash_loop *L)
             ash_status st = ash_provider_wait(L->stream, wfd, 1000, &ready);
             if (st == ASH_OK)
                 st = ash_provider_pump(L->stream, &L->running);
-            if (st != ASH_OK)
+            if (st != ASH_OK) {
+                memcpy(L->stream_err, ash_errbuf, sizeof L->stream_err);
                 L->running = 0;
+            }
             if (ready)
                 read_input(L);
         } else if (w == ASH_WAIT_TOOL) {
