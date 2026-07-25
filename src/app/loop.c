@@ -545,12 +545,22 @@ static void queue_submit(struct ash_loop *L)
     ash_textarea_clear(&L->ta);
 }
 
-static int busy_input(struct ash_loop *L)
-{
-    if (!L->tui)
-        return inbuf_has_cancel(L);
+typedef enum {
+    ASH_IN_PROMPT,
+    ASH_IN_BUSY,
+    ASH_IN_LOGIN
+} ash_in_mode;
 
-    int cancel = 0;
+typedef enum {
+    ASH_IN_NONE,
+    ASH_IN_SUBMIT,
+    ASH_IN_CANCEL,
+    ASH_IN_EOF
+} ash_in_result;
+
+static ash_in_result input_dispatch(struct ash_loop *L, ash_in_mode mode)
+{
+    ash_in_result res = ASH_IN_NONE;
     uint32_t off = 0;
     while (off < L->inlen) {
         ash_input_event evs[32];
@@ -561,6 +571,7 @@ static int busy_input(struct ash_loop *L)
         if (consumed == 0)
             break;
         off += consumed;
+
         for (uint32_t i = 0; i < produced; i++) {
             const ash_input_event *ev = &evs[i];
             if (ev->kind == ASH_EV_MOUSE) {
@@ -569,42 +580,115 @@ static int busy_input(struct ash_loop *L)
             }
             if (handle_page_key(L, ev))
                 continue;
-            if (ev->kind == ASH_EV_KEY && (ev->key == 'c' || ev->key == 'C') &&
-                (ev->mods & ASH_MOD_CTRL) && (ev->mods & ASH_MOD_SHIFT)) {
-                do_copy(L);
-                continue;
-            }
             if (ev->kind == ASH_EV_KEY && ev->key == 27 && L->sel.active) {
                 ash_sel_clear(&L->sel);
                 continue;
             }
-            if (ev->kind == ASH_EV_KEY && ev->key == 'o' &&
+            if (L->tui && ev->kind == ASH_EV_KEY && ev->key == 'o' &&
                 (ev->mods & ASH_MOD_CTRL)) {
                 L->tools_expanded = !L->tools_expanded;
                 reproject_full(L, ui_width(L));
                 continue;
             }
+
             ash_key k = ash_key_map(ev);
+            if (k.cmd == ASH_EC_COPY) {
+                do_copy(L);
+                continue;
+            }
+            if (k.cmd == ASH_EC_CUT) {
+                do_cut(L);
+                continue;
+            }
+            if (k.cmd == ASH_EC_PASTE)
+                continue;
+            if (k.cmd == ASH_EC_SUBMIT) {
+                if (mode == ASH_IN_BUSY) {
+                    queue_submit(L);
+                    continue;
+                }
+                ash_buf_init(&L->line, &L->mem.turn);
+                ash_textarea_text(&L->ta, &L->line);
+                if (L->tui)
+                    ash_textarea_clear(&L->ta);
+                else
+                    L->ta_live = 0;
+                if (mode == ASH_IN_LOGIN) {
+                    write_str(L, "\n");
+                } else {
+                    const char *bc;
+                    size_t bl;
+                    if (!ash_bang_split((const char *)L->line.data, L->line.len,
+                                        &bc, &bl))
+                        ui_user(L, (const char *)L->line.data, L->line.len);
+                }
+                res = ASH_IN_SUBMIT;
+                goto done;
+            }
+            if (k.cmd == ASH_EC_EOF) {
+                if (mode == ASH_IN_BUSY || ash_textarea_len(&L->ta) != 0)
+                    continue;
+                res = ASH_IN_EOF;
+                goto done;
+            }
             if (k.cmd == ASH_EC_CANCEL) {
+                if (mode == ASH_IN_LOGIN) {
+                    res = ASH_IN_CANCEL;
+                    goto done;
+                }
                 if (!ash_sel_empty(&L->sel)) {
                     do_copy(L);
                     ash_sel_clear(&L->sel);
                     continue;
                 }
-                cancel = 1;
+                if (mode == ASH_IN_BUSY) {
+                    res = ASH_IN_CANCEL;
+                    continue;
+                }
+                if (ash_textarea_len(&L->ta) == 0) {
+                    res = ASH_IN_EOF;
+                    goto done;
+                }
+                ash_textarea_clear(&L->ta);
+                if (!L->tui) {
+                    write_str(L, "\n");
+                    write_str(L, "> ");
+                }
                 continue;
             }
-            if (k.cmd == ASH_EC_SUBMIT) {
-                queue_submit(L);
+            if (k.cmd == ASH_EC_INSERT || k.cmd == ASH_EC_PASTE_CHUNK) {
+                ash_textarea_insert(&L->ta, k.text, k.len);
+                if (!L->tui)
+                    write_bytes(L, k.text, k.len);
                 continue;
             }
-            if (k.cmd == ASH_EC_EOF)
+            if (k.cmd == ASH_EC_NEWLINE) {
+                ash_textarea_insert(&L->ta, "\n", 1);
+                if (!L->tui)
+                    write_str(L, "\n");
                 continue;
+            }
+            if (k.cmd == ASH_EC_BACKSPACE) {
+                int at_end = ash_textarea_at_end(&L->ta);
+                int w = ash_textarea_backspace(&L->ta);
+                if (!L->tui)
+                    for (int j = 0; at_end && j < w; j++)
+                        write_str(L, "\b \b");
+                continue;
+            }
             ash_textarea_apply(&L->ta, k);
         }
     }
+done:
     L->inlen = 0;
-    return cancel;
+    return res;
+}
+
+static int busy_input(struct ash_loop *L)
+{
+    if (!L->tui)
+        return inbuf_has_cancel(L);
+    return input_dispatch(L, ASH_IN_BUSY) == ASH_IN_CANCEL;
 }
 
 static const char *arena_dup(ash_arena *a, const char *s, size_t len)
@@ -660,114 +744,16 @@ static int read_line(ash_co *co, struct ash_loop *L)
     L->ta_live = 1;
     for (;;) {
         ash_co_yield(co, ASH_WAIT_INPUT);
-        if (L->inlen == 0) {
-            L->ta_live = 0;
-            return RL_EOF;
-        }
-
-        uint32_t off = 0;
-        while (off < L->inlen) {
-            ash_input_event evs[32];
-            uint32_t consumed = 0, produced = 0;
-            if (ash_input_feed(&L->dfa, L->inbuf + off, (uint32_t)(L->inlen - off),
-                               evs, 32, &consumed, &produced) != ASH_OK)
-                break;
-            if (consumed == 0)
-                break;
-            off += consumed;
-
-            for (uint32_t i = 0; i < produced; i++) {
-                const ash_input_event *ev = &evs[i];
-                if (ev->kind == ASH_EV_MOUSE) {
-                    handle_mouse(L, ev);
-                    continue;
-                }
-                if (handle_page_key(L, ev))
-                    continue;
-                if (ev->kind == ASH_EV_KEY && ev->key == 27 && L->sel.active) {
-                    ash_sel_clear(&L->sel);
-                    continue;
-                }
-                if (L->tui && ev->kind == ASH_EV_KEY && ev->key == 'o' &&
-                    (ev->mods & ASH_MOD_CTRL)) {
-                    L->tools_expanded = !L->tools_expanded;
-                    reproject_full(L, ui_width(L));
-                    continue;
-                }
-                ash_key k = ash_key_map(&evs[i]);
-                if (k.cmd == ASH_EC_COPY) {
-                    do_copy(L);
-                    continue;
-                }
-                if (k.cmd == ASH_EC_CUT) {
-                    do_cut(L);
-                    continue;
-                }
-                if (k.cmd == ASH_EC_PASTE)
-                    continue;
-                if (k.cmd == ASH_EC_SUBMIT) {
-                    ash_buf_init(&L->line, &L->mem.turn);
-                    ash_textarea_text(&L->ta, &L->line);
-                    if (L->tui)
-                        ash_textarea_clear(&L->ta);
-                    else
-                        L->ta_live = 0;
-                    const char *bc;
-                    size_t bl;
-                    if (!ash_bang_split((const char *)L->line.data, L->line.len,
-                                        &bc, &bl))
-                        ui_user(L, (const char *)L->line.data, L->line.len);
-                    return RL_OK;
-                }
-                if (k.cmd == ASH_EC_EOF) {
-                    if (ash_textarea_len(&L->ta) == 0) {
-                        L->ta_live = 0;
-                        return RL_EOF;
-                    }
-                    continue;
-                }
-                if (k.cmd == ASH_EC_CANCEL) {
-                    if (!ash_sel_empty(&L->sel)) {
-                        do_copy(L);
-                        ash_sel_clear(&L->sel);
-                        continue;
-                    }
-                    if (ash_textarea_len(&L->ta) == 0) {
-                        L->ta_live = 0;
-                        return RL_EOF;
-                    }
-                    ash_textarea_clear(&L->ta);
-                    if (!L->tui) {
-                        write_str(L, "\n");
-                        write_str(L, "> ");
-                    }
-                    continue;
-                }
-                if (k.cmd == ASH_EC_INSERT || k.cmd == ASH_EC_PASTE_CHUNK) {
-                    ash_textarea_insert(&L->ta, k.text, k.len);
-                    if (!L->tui)
-                        write_bytes(L, k.text, k.len);
-                    continue;
-                }
-                if (k.cmd == ASH_EC_NEWLINE) {
-                    ash_textarea_insert(&L->ta, "\n", 1);
-                    if (!L->tui)
-                        write_str(L, "\n");
-                    continue;
-                }
-                if (k.cmd == ASH_EC_BACKSPACE) {
-                    int at_end = ash_textarea_at_end(&L->ta);
-                    int w = ash_textarea_backspace(&L->ta);
-                    if (!L->tui)
-                        for (int j = 0; at_end && j < w; j++)
-                            write_str(L, "\b \b");
-                    continue;
-                }
-                ash_textarea_apply(&L->ta, k);
-            }
-        }
-        L->inlen = 0;
+        if (L->inlen == 0)
+            break;
+        ash_in_result r = input_dispatch(L, ASH_IN_PROMPT);
+        if (r == ASH_IN_SUBMIT)
+            return RL_OK;
+        if (r == ASH_IN_EOF)
+            break;
     }
+    L->ta_live = 0;
+    return RL_EOF;
 }
 
 static void report_error(struct ash_loop *L, const char *text)
@@ -1093,62 +1079,20 @@ static int login_read(ash_co *co, struct ash_loop *L)
     L->ta_live = 1;
     for (;;) {
         ash_co_yield(co, ASH_WAIT_INPUT);
-        if (L->inlen == 0) {
+        if (L->inlen == 0)
+            break;
+        ash_in_result r = input_dispatch(L, ASH_IN_LOGIN);
+        if (r == ASH_IN_SUBMIT)
+            return LOGIN_OK;
+        if (r == ASH_IN_CANCEL) {
             L->ta_live = 0;
-            return LOGIN_EOF;
+            return LOGIN_CANCEL;
         }
-        uint32_t off = 0;
-        while (off < L->inlen) {
-            ash_input_event evs[32];
-            uint32_t consumed = 0, produced = 0;
-            if (ash_input_feed(&L->dfa, L->inbuf + off, (uint32_t)(L->inlen - off),
-                               evs, 32, &consumed, &produced) != ASH_OK)
-                break;
-            if (consumed == 0)
-                break;
-            off += consumed;
-            for (uint32_t i = 0; i < produced; i++) {
-                ash_key k = ash_key_map(&evs[i]);
-                if (k.cmd == ASH_EC_CANCEL) {
-                    L->ta_live = 0;
-                    return LOGIN_CANCEL;
-                }
-                if (k.cmd == ASH_EC_SUBMIT) {
-                    ash_buf_init(&L->line, &L->mem.turn);
-                    ash_textarea_text(&L->ta, &L->line);
-                    if (L->tui)
-                        ash_textarea_clear(&L->ta);
-                    else
-                        L->ta_live = 0;
-                    write_str(L, "\n");
-                    return LOGIN_OK;
-                }
-                if (k.cmd == ASH_EC_EOF) {
-                    if (ash_textarea_len(&L->ta) == 0) {
-                        L->ta_live = 0;
-                        return LOGIN_EOF;
-                    }
-                    continue;
-                }
-                if (k.cmd == ASH_EC_INSERT || k.cmd == ASH_EC_PASTE_CHUNK) {
-                    ash_textarea_insert(&L->ta, k.text, k.len);
-                    if (!L->tui)
-                        write_bytes(L, k.text, k.len);
-                    continue;
-                }
-                if (k.cmd == ASH_EC_BACKSPACE) {
-                    int at_end = ash_textarea_at_end(&L->ta);
-                    int w = ash_textarea_backspace(&L->ta);
-                    if (!L->tui)
-                        for (int j = 0; at_end && j < w; j++)
-                            write_str(L, "\b \b");
-                    continue;
-                }
-                ash_textarea_apply(&L->ta, k);
-            }
-        }
-        L->inlen = 0;
+        if (r == ASH_IN_EOF)
+            break;
     }
+    L->ta_live = 0;
+    return LOGIN_EOF;
 }
 
 static void login_split(const ash_buf *line, ash_arena *a, const char **code,
