@@ -1,3 +1,10 @@
+function(ash_default_test_timeout)
+  get_property(defined_tests DIRECTORY PROPERTY TESTS)
+  set_tests_properties(${defined_tests} PROPERTIES TIMEOUT 600)
+endfunction()
+
+cmake_language(DEFER CALL ash_default_test_timeout)
+
 function(ash_unit_test name)
   add_executable(${name} base/${name}.c $<TARGET_OBJECTS:ash_base>)
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
