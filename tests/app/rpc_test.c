@@ -111,28 +111,23 @@ static void report_status(const char *call, ash_status st)
     fprintf(stderr, "  %s failed: %s (%d)\n", call, ash_status_str(st), (int)st);
 }
 
-static ash_status write_all(int c, const char *p, size_t n)
+static ash_status write_all(int c, const char *p, size_t n, int *err)
 {
     size_t off = 0;
-    ssize_t w = 0;
-    int err = 0;
+    *err = 0;
     while (off < n) {
-        w = write(c, p + off, n - off);
-        if (w <= 0) {
-            err = errno;
-            break;
+        ssize_t w = write(c, p + off, n - off);
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w < 0) {
+            *err = errno;
+            return ASH_ERR_IO;
         }
+        if (w == 0)
+            return ASH_ERR_IO;
         off += (size_t)w;
     }
-    ASH_CHECK(off == n);
-    if (off == n)
-        return ASH_OK;
-    if (w == 0) {
-        fprintf(stderr, "  write wrote 0 of %zu remaining bytes\n", n - off);
-        return ASH_ERR_IO;
-    }
-    report_errno("write", err);
-    return ASH_ERR_OS;
+    return ASH_OK;
 }
 
 static int listen_loopback(int *port, const char **call, int *err)
@@ -191,17 +186,18 @@ static void serve_body(int lfd, const char *body)
         close(c);
         return;
     }
-    ash_status wst = write_all(c, hdr, (size_t)hn);
+    int werr = 0;
+    ash_status wst = write_all(c, hdr, (size_t)hn, &werr);
     ASH_CHECK(wst == ASH_OK);
     if (wst != ASH_OK) {
-        report_status("write_all", wst);
+        report_errno("write", werr);
         close(c);
         return;
     }
-    wst = write_all(c, body, strlen(body));
+    wst = write_all(c, body, strlen(body), &werr);
     ASH_CHECK(wst == ASH_OK);
     if (wst != ASH_OK)
-        report_status("write_all", wst);
+        report_errno("write", werr);
     close(c);
 }
 
@@ -368,11 +364,12 @@ static void test_sync(void)
         "{\"id\":\"4\",\"type\":\"bogus\"}\n"
         "garbage line\n"
         "\n";
-    ash_status wst = write_all(inp[1], cmds, strlen(cmds));
+    int werr = 0;
+    ash_status wst = write_all(inp[1], cmds, strlen(cmds), &werr);
     close(inp[1]);
     ASH_CHECK(wst == ASH_OK);
     if (wst != ASH_OK) {
-        report_status("write_all", wst);
+        report_errno("write", werr);
         close(inp[0]);
         return;
     }
@@ -419,11 +416,12 @@ static void test_prompt(void)
     int inp[2] = { -1, -1 };
     PIPE_OR_BAIL(inp, kill_child(pid));
     const char *cmd = "{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"hi\"}\n";
-    ash_status wst = write_all(inp[1], cmd, strlen(cmd));
+    int werr = 0;
+    ash_status wst = write_all(inp[1], cmd, strlen(cmd), &werr);
     close(inp[1]);
     ASH_CHECK(wst == ASH_OK);
     if (wst != ASH_OK) {
-        report_status("write_all", wst);
+        report_errno("write", werr);
         close(inp[0]);
         kill_child(pid);
         return;
@@ -474,11 +472,12 @@ static void test_prompt_tool(void)
     int inp[2] = { -1, -1 };
     PIPE_OR_BAIL(inp, kill_child(pid));
     const char *cmd = "{\"type\":\"prompt\",\"message\":\"run it\"}\n";
-    ash_status wst = write_all(inp[1], cmd, strlen(cmd));
+    int werr = 0;
+    ash_status wst = write_all(inp[1], cmd, strlen(cmd), &werr);
     close(inp[1]);
     ASH_CHECK(wst == ASH_OK);
     if (wst != ASH_OK) {
-        report_status("write_all", wst);
+        report_errno("write", werr);
         close(inp[0]);
         kill_child(pid);
         return;
@@ -561,11 +560,12 @@ static void test_prompt_tool_binary(void)
     int inp[2] = { -1, -1 };
     PIPE_OR_BAIL(inp, kill_child(pid));
     const char *cmd = "{\"type\":\"prompt\",\"message\":\"dump bytes\"}\n";
-    ash_status wst = write_all(inp[1], cmd, strlen(cmd));
+    int werr = 0;
+    ash_status wst = write_all(inp[1], cmd, strlen(cmd), &werr);
     close(inp[1]);
     ASH_CHECK(wst == ASH_OK);
     if (wst != ASH_OK) {
-        report_status("write_all", wst);
+        report_errno("write", werr);
         close(inp[0]);
         kill_child(pid);
         return;
