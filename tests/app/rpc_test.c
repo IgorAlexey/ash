@@ -4,6 +4,7 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
@@ -172,8 +173,32 @@ static void serve_body(int lfd, const char *body)
         report_errno("accept", err);
         return;
     }
-    char req[2048];
-    (void)read(c, req, sizeof req);
+    char req[4096];
+    size_t got = 0;
+    char *end = NULL;
+    while (end == NULL) {
+        if (got == sizeof req)
+            break;
+        ssize_t r = read(c, req + got, sizeof req - got);
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+        end = memmem(req, got, "\r\n\r\n", 4);
+    }
+    if (end != NULL) {
+        const char *cl = memmem(req, (size_t)(end - req), "Content-Length: ", 16);
+        if (cl != NULL) {
+            size_t need = strtoul(cl + 16, NULL, 10);
+            size_t have = got - (size_t)(end + 4 - req);
+            char skip[4096];
+            while (have < need) {
+                ssize_t r = read(c, skip, sizeof skip);
+                if (r <= 0)
+                    break;
+                have += (size_t)r;
+            }
+        }
+    }
     char hdr[256];
     int hn = snprintf(hdr, sizeof hdr,
                       "HTTP/1.1 200 OK\r\n"
