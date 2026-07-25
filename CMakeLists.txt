@@ -136,7 +136,7 @@ add_executable(ash
   src/term/screen.c
   src/term/signals.c
   src/term/input.c)
-target_link_libraries(ash PRIVATE ash_tools ash_ui ash_edit)
+target_link_libraries(ash PRIVATE ash_tools ash_ui ash_edit ash_ext)
 
 enable_testing()
 add_subdirectory(tests)
