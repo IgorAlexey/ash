@@ -456,12 +456,17 @@ static void read_request(int c)
     }
 }
 
-static void serve_body(int lfd, const char *body)
+static int accept_request(int lfd)
 {
     int c = accept(lfd, NULL, NULL);
     if (c < 0)
-        return;
+        return -1;
     read_request(c);
+    return c;
+}
+
+static void respond_body(int c, const char *body)
+{
     char hdr[256];
     int hn = snprintf(hdr, sizeof hdr,
                       "HTTP/1.1 200 OK\r\n"
@@ -476,25 +481,21 @@ static void serve_body(int lfd, const char *body)
     close(c);
 }
 
-static void serve_body_delay(int lfd, const char *body, long ms)
+static void serve_body(int lfd, const char *body)
 {
-    int c = accept(lfd, NULL, NULL);
+    int c = accept_request(lfd);
     if (c < 0)
         return;
-    read_request(c);
+    respond_body(c, body);
+}
+
+static void serve_body_delay(int lfd, const char *body, long ms)
+{
+    int c = accept_request(lfd);
+    if (c < 0)
+        return;
     nap(ms);
-    char hdr[256];
-    int hn = snprintf(hdr, sizeof hdr,
-                      "HTTP/1.1 200 OK\r\n"
-                      "Content-Type: text/event-stream\r\n"
-                      "Content-Length: %zu\r\n"
-                      "Connection: close\r\n\r\n",
-                      strlen(body));
-    if (hn > 0) {
-        serve_write(c, hdr, (size_t)hn);
-        serve_write(c, body, strlen(body));
-    }
-    close(c);
+    respond_body(c, body);
 }
 
 static void serve_hold(int lfd)
@@ -518,10 +519,9 @@ static void serve_hold(int lfd)
 
 static void serve_reset(int lfd)
 {
-    int c = accept(lfd, NULL, NULL);
+    int c = accept_request(lfd);
     if (c < 0)
         return;
-    read_request(c);
     const char *hdr =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
@@ -671,22 +671,30 @@ static void test_cancel_same_read(void)
     WAIT_SERVER(spid);
 }
 
-static void paste_cancel_case(const char *seq, size_t n)
+static void paste_cancel_case(const char *head, const char *tail)
 {
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
+
+    int inp[2];
+    ASH_CHECK(pipe(inp) == 0);
+
     pid_t spid = fork_server();
     if (spid == 0) {
-        serve_body_delay(lfd, HAPPY, 400);
+        close(inp[0]);
+        int c = accept_request(lfd);
+        if (c < 0)
+            _exit(0);
+        write_str_all(inp[1], tail);
+        close(inp[1]);
+        nap(400);
+        respond_body(c, HAPPY);
         close(lfd);
         _exit(0);
     }
     close(lfd);
-
-    int inp[2];
-    ASH_CHECK(pipe(inp) == 0);
-    write_all(inp[1], seq, n);
+    write_str_all(inp[1], head);
     close(inp[1]);
 
     char url[64];
@@ -702,43 +710,38 @@ static void paste_cancel_case(const char *seq, size_t n)
 
 static void test_paste_cancel_parsed(void)
 {
-    static const char SEQ[] = "hello\r\x1b[200~\x03\x1b[201~";
-    paste_cancel_case(SEQ, sizeof SEQ - 1);
+    paste_cancel_case("hello\r\x1b[200~\x03\x1b[201~", "");
 }
 
 static void test_paste_cancel_unfed(void)
 {
-    enum { READ_SPLIT = 4096 };
-    static const char TAIL[] = "\x03\x1b[201~";
-    static char seq[READ_SPLIT + sizeof TAIL];
-
-    size_t n = 0;
-    memcpy(seq + n, "hello\r\x1b[200~", 12);
-    n += 12;
-    memset(seq + n, 'a', (size_t)READ_SPLIT - n);
-    n = READ_SPLIT;
-    memcpy(seq + n, TAIL, sizeof TAIL - 1);
-    n += sizeof TAIL - 1;
-
-    paste_cancel_case(seq, n);
+    paste_cancel_case("hello\r\x1b[200~", "\x03\x1b[201~");
 }
 
-static void headless_typeahead_case(const char *seq, size_t n)
+static void headless_typeahead_case(const char *head, const char *tail)
 {
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
+
+    int inp[2];
+    ASH_CHECK(pipe(inp) == 0);
+
     pid_t spid = fork_server();
     if (spid == 0) {
-        serve_body_delay(lfd, HAPPY, 400);
+        close(inp[0]);
+        int c = accept_request(lfd);
+        if (c < 0)
+            _exit(0);
+        write_str_all(inp[1], tail);
+        close(inp[1]);
+        nap(400);
+        respond_body(c, HAPPY);
         close(lfd);
         _exit(0);
     }
     close(lfd);
-
-    int inp[2];
-    ASH_CHECK(pipe(inp) == 0);
-    write_all(inp[1], seq, n);
+    write_str_all(inp[1], head);
     close(inp[1]);
 
     char url[64];
@@ -755,25 +758,12 @@ static void headless_typeahead_case(const char *seq, size_t n)
 
 static void test_headless_typeahead_discarded(void)
 {
-    static const char SEQ[] = "hello\r!echo LAT''ER\r";
-    headless_typeahead_case(SEQ, sizeof SEQ - 1);
+    headless_typeahead_case("hello\r!echo LAT''ER\r", "");
 }
 
 static void test_headless_midturn_discarded(void)
 {
-    enum { READ_SPLIT = 4096 };
-    static const char TAIL[] = "!echo LAT''ER\r";
-    static char seq[READ_SPLIT + sizeof TAIL];
-
-    size_t n = 0;
-    memcpy(seq + n, "hello\r", 6);
-    n += 6;
-    memset(seq + n, 'a', (size_t)READ_SPLIT - n);
-    n = READ_SPLIT;
-    memcpy(seq + n, TAIL, sizeof TAIL - 1);
-    n += sizeof TAIL - 1;
-
-    headless_typeahead_case(seq, n);
+    headless_typeahead_case("hello\r", "!echo LAT''ER\r");
 }
 
 static void test_queue_while_busy(void)
@@ -963,29 +953,41 @@ static void test_two_submits_one_write(void)
 
 static void test_paste_mark_split(void)
 {
-    enum { READ_SPLIT = 4096 };
-    static const char TAIL[] = "X\x1b[201~\x03!echo PA''STE\r";
-    static char seq[READ_SPLIT + sizeof TAIL];
-
-    size_t n = 0;
-    memcpy(seq + n, "\x1b[200~", 6);
-    n += 6;
-    memset(seq + n, 'a', (size_t)READ_SPLIT - 3 - n);
-    n = READ_SPLIT - 3;
-    memcpy(seq + n, "\x1b[2", 3);
-    n += 3;
-    memcpy(seq + n, TAIL, sizeof TAIL - 1);
-    n += sizeof TAIL - 1;
-
-    int inp[2];
+    int inp[2], outp[2];
     ASH_CHECK(pipe(inp) == 0);
-    write_all(inp[1], seq, n);
-    close(inp[1]);
+    ASH_CHECK(pipe(outp) == 0);
 
-    char out[8192];
-    run_loop("http://127.0.0.1:1/", inp[0], out, sizeof out);
+    pid_t lpid = fork_checked();
+    if (lpid == 0) {
+        close(inp[1]);
+        close(outp[0]);
+        ash_loop_cfg cfg = {
+            .url = "http://127.0.0.1:1/", .api_key = "k", .model = "claude-x",
+            .max_tokens = 64,
+        };
+        ash_status st = ash_loop_run(&cfg, inp[0], outp[1]);
+        (void)st;
+        close(inp[0]);
+        close(outp[1]);
+        _exit(0);
+    }
     close(inp[0]);
+    close(outp[1]);
 
+    write_str_all(inp[1], "\x1b[200~" "SPLITMARK" "\x1b[2");
+
+    static char out[8192];
+    size_t got = 0;
+    out[0] = 0;
+    ASH_CHECK(pty_read_until(outp[0], out, sizeof out, &got, "SPLITMARK"));
+
+    write_str_all(inp[1], "X\x1b[201~\x03!echo PA''STE\r");
+    close(inp[1]);
+    ASH_CHECK(pty_read_until(outp[0], out, sizeof out, &got, NULL));
+    close(outp[0]);
+    WAIT_ROLE(lpid, "loop");
+
+    ASH_CHECK(strstr(out, "SPLITMARK" "\x1b[2" "X") != NULL);
     ASH_CHECK(strstr(out, "PASTE") != NULL);
     ASH_CHECK(strstr(out, "bye") != NULL);
 }
