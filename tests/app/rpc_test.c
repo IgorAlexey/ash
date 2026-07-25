@@ -227,13 +227,31 @@ static ash_status run_rpc(const char *url, int in_fd, char *out, size_t cap)
     return ASH_OK;
 }
 
-static void reap(pid_t pid)
+static void report_wstatus(const char *what, int wstatus)
+{
+    if (WIFSIGNALED(wstatus)) {
+        fprintf(stderr, "  %s killed by signal %d\n", what, WTERMSIG(wstatus));
+        return;
+    }
+    if (WIFEXITED(wstatus)) {
+        fprintf(stderr, "  %s exited with status %d\n", what,
+                WEXITSTATUS(wstatus));
+        return;
+    }
+    fprintf(stderr, "  %s ended with wait status 0x%x\n", what,
+            (unsigned)wstatus);
+}
+
+static void reap(pid_t pid, int *wstatus)
 {
     ASH_CHECK(pid > 0);
     if (pid <= 0)
         return;
-    while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+    int st = 0;
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
         ;
+    if (wstatus != NULL)
+        *wstatus = st;
 }
 
 static void kill_child(pid_t pid)
@@ -242,8 +260,19 @@ static void kill_child(pid_t pid)
     if (pid <= 0)
         return;
     (void)kill(pid, SIGKILL);
-    reap(pid);
+    reap(pid, NULL);
 }
+
+#define REAP_OK(pid)                                            \
+    do {                                                        \
+        int wstatus = 0;                                        \
+        reap(pid, &wstatus);                                    \
+        int child_ok = WIFEXITED(wstatus) &&                    \
+                       WEXITSTATUS(wstatus) == 0;               \
+        ASH_CHECK(child_ok);                                    \
+        if (!child_ok)                                          \
+            report_wstatus("server child", wstatus);            \
+    } while (0)
 
 #define FORK_OR_BAIL(pid, cleanup)              \
     do {                                        \
@@ -355,7 +384,7 @@ static void test_prompt(void)
     if (pid == 0) {
         serve_body(lfd, HAPPY);
         close(lfd);
-        _exit(0);
+        _exit(ash_test_fails == 0 ? 0 : 1);
     }
     close(lfd);
 
@@ -383,7 +412,7 @@ static void test_prompt(void)
     ASH_CHECK(strstr(out, "\"event\":\"message_end\",\"stop_reason\":\"end_turn\"") != NULL);
     ASH_CHECK(strstr(out, "\"event\":\"turn_end\"") != NULL);
     ASH_CHECK(strstr(out, "\"command\":\"prompt\",\"id\":\"p1\",\"success\":true") != NULL);
-    reap(pid);
+    REAP_OK(pid);
 }
 
 static void test_prompt_tool(void)
@@ -403,7 +432,7 @@ static void test_prompt_tool(void)
         serve_body(lfd, TOOL_USE);
         serve_body(lfd, TOOL_FINAL);
         close(lfd);
-        _exit(0);
+        _exit(ash_test_fails == 0 ? 0 : 1);
     }
     close(lfd);
 
@@ -431,7 +460,7 @@ static void test_prompt_tool(void)
     ASH_CHECK(strstr(out, "TOOLTEST") != NULL);
     ASH_CHECK(strstr(out, "\"is_error\":false") != NULL);
     ASH_CHECK(strstr(out, "\"command\":\"prompt\",\"success\":true") != NULL);
-    reap(pid);
+    REAP_OK(pid);
 }
 
 static void check_tool_end_line(ash_arena *a, const char *line, size_t n,
@@ -483,7 +512,7 @@ static void test_prompt_tool_binary(void)
         serve_body(lfd, TOOL_USE_BINARY);
         serve_body(lfd, TOOL_FINAL);
         close(lfd);
-        _exit(0);
+        _exit(ash_test_fails == 0 ? 0 : 1);
     }
     close(lfd);
 
@@ -503,7 +532,7 @@ static void test_prompt_tool_binary(void)
         kill_child(pid);
         return;
     }
-    reap(pid);
+    REAP_OK(pid);
 
     ash_arena a;
     st = ash_arena_create(&a, "toolbin", 1u << 18);
