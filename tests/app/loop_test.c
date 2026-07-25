@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -220,6 +221,19 @@ static void nap(long ms)
     (void)nanosleep(&ts, NULL);
 }
 
+static int pty_is_raw(int mfd)
+{
+    struct termios t;
+    return tcgetattr(mfd, &t) == 0 && (t.c_lflag & ECHO) == 0;
+}
+
+static void wait_until_raw(int mfd)
+{
+    for (int i = 0; i < 5000 && !pty_is_raw(mfd); i++)
+        nap(1);
+    ASH_CHECK(pty_is_raw(mfd));
+}
+
 static void write_all(int c, const char *p, size_t n)
 {
     size_t off = 0;
@@ -257,13 +271,40 @@ static int listen_loopback(int *port)
     return lfd;
 }
 
+static void read_request(int c)
+{
+    char head[4096];
+    size_t got = 0;
+    char *end = NULL;
+    while (end == NULL) {
+        if (got == sizeof head)
+            return;
+        ssize_t r = read(c, head + got, sizeof head - got);
+        if (r <= 0)
+            return;
+        got += (size_t)r;
+        end = memmem(head, got, "\r\n\r\n", 4);
+    }
+    const char *cl = memmem(head, (size_t)(end - head), "Content-Length: ", 16);
+    if (cl == NULL)
+        return;
+    size_t need = strtoul(cl + 16, NULL, 10);
+    size_t body = got - (size_t)(end + 4 - head);
+    char skip[4096];
+    while (body < need) {
+        ssize_t r = read(c, skip, sizeof skip);
+        if (r <= 0)
+            return;
+        body += (size_t)r;
+    }
+}
+
 static void serve_body(int lfd, const char *body)
 {
     int c = accept(lfd, NULL, NULL);
     if (c < 0)
         return;
-    char req[2048];
-    (void)read(c, req, sizeof req);
+    read_request(c);
     char hdr[256];
     int hn = snprintf(hdr, sizeof hdr,
                       "HTTP/1.1 200 OK\r\n"
@@ -283,8 +324,7 @@ static void serve_body_delay(int lfd, const char *body, long ms)
     int c = accept(lfd, NULL, NULL);
     if (c < 0)
         return;
-    char req[2048];
-    (void)read(c, req, sizeof req);
+    read_request(c);
     nap(ms);
     char hdr[256];
     int hn = snprintf(hdr, sizeof hdr,
@@ -476,6 +516,7 @@ static void test_queue_while_busy(void)
         _exit(0);
     }
     close(sfd);
+    wait_until_raw(mfd);
 
     pid_t wpid = fork();
     ASH_CHECK(wpid >= 0);
@@ -1137,6 +1178,7 @@ static void confirm_case(int accept, const char *want)
         _exit(0);
     }
     close(sfd);
+    wait_until_raw(mfd);
 
     pid_t wpid = fork();
     ASH_CHECK(wpid >= 0);
