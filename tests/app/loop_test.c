@@ -277,6 +277,7 @@ static int pty_read_until(int mfd, char *out, size_t cap, size_t *got,
 }
 
 enum { SERVE_TIMEOUT_S = 30 };
+enum { SERVE_NO_REQUEST = 20 };
 enum { CHILD_WAIT_MS = 60000, CHILD_POLL_MS = 10 };
 enum { SERVE_WRITE_FAILED = 21, SERVE_NO_SIGPIPE = 22 };
 
@@ -352,6 +353,9 @@ static void wait_check(pid_t pid, const char *role, int server,
     } else if (server && WEXITSTATUS(st) == SERVE_NO_SIGPIPE) {
         (void)snprintf(msg, sizeof msg, "%s exited %d, could not ignore SIGPIPE",
                        role, SERVE_NO_SIGPIPE);
+    } else if (server && WEXITSTATUS(st) == SERVE_NO_REQUEST) {
+        (void)snprintf(msg, sizeof msg, "%s exited %d, no request arrived", role,
+                       SERVE_NO_REQUEST);
     } else if (WEXITSTATUS(st) != 0) {
         (void)snprintf(msg, sizeof msg, "%s exited %d", role, WEXITSTATUS(st));
     }
@@ -460,7 +464,7 @@ static int accept_request(int lfd)
 {
     int c = accept(lfd, NULL, NULL);
     if (c < 0)
-        return -1;
+        _exit(SERVE_NO_REQUEST);
     read_request(c);
     return c;
 }
@@ -483,17 +487,12 @@ static void respond_body(int c, const char *body)
 
 static void serve_body(int lfd, const char *body)
 {
-    int c = accept_request(lfd);
-    if (c < 0)
-        return;
-    respond_body(c, body);
+    respond_body(accept_request(lfd), body);
 }
 
 static void serve_body_delay(int lfd, const char *body, long ms)
 {
     int c = accept_request(lfd);
-    if (c < 0)
-        return;
     nap(ms);
     respond_body(c, body);
 }
@@ -520,8 +519,6 @@ static void serve_hold(int lfd)
 static void serve_reset(int lfd)
 {
     int c = accept_request(lfd);
-    if (c < 0)
-        return;
     const char *hdr =
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
@@ -684,8 +681,6 @@ static void paste_cancel_case(const char *head, const char *tail)
     if (spid == 0) {
         close(inp[0]);
         int c = accept_request(lfd);
-        if (c < 0)
-            _exit(0);
         write_str_all(inp[1], tail);
         close(inp[1]);
         nap(400);
@@ -731,8 +726,6 @@ static void headless_typeahead_case(const char *head, const char *tail)
     if (spid == 0) {
         close(inp[0]);
         int c = accept_request(lfd);
-        if (c < 0)
-            _exit(0);
         write_str_all(inp[1], tail);
         close(inp[1]);
         nap(400);
