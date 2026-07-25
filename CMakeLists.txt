@@ -3,9 +3,8 @@ project(ash C)
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
   message(FATAL_ERROR
-    "ash is Linux-only by design (see DOCTRINE.md, Platform). ucontext, "
-    "pidfd, eventfd, epoll, and the --whole-archive layering check all "
-    "assume Linux and glibc.")
+    "ash is Linux-only by design. ucontext, pidfd, eventfd, epoll, and "
+    "the --whole-archive layering check all assume Linux and glibc.")
 endif()
 
 set(CMAKE_C_STANDARD 17)
