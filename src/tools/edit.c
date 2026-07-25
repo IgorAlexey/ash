@@ -387,6 +387,15 @@ const char *ash_edit_apply(ash_arena *a, const char *norm, size_t nlen,
     return newc;
 }
 
+static ash_confirm_fn g_confirm;
+static void *g_confirm_ud;
+
+void ash_tools_set_confirm(ash_confirm_fn fn, void *ud)
+{
+    g_confirm = fn;
+    g_confirm_ud = ud;
+}
+
 ash_status ash_tool_edit(ash_arena *out, const ash_json *args,
                          ash_tool_result *res)
 {
@@ -468,6 +477,25 @@ ash_status ash_tool_edit(ash_arena *out, const ash_json *args,
     if (newc == NULL) {
         tools_error(out, res, err ? err : "edit: could not apply edits");
         return ASH_OK;
+    }
+
+    if (g_confirm != NULL) {
+        const char *accepted = NULL;
+        size_t accepted_len = 0;
+        if (!g_confirm(g_confirm_ud, path, norm, nlen, newc, newlen, &accepted,
+                       &accepted_len)) {
+            ash_buf b;
+            ash_buf_init(&b, out);
+            ash_buf_append_cstr(&b, "edit rejected: the user declined the "
+                                    "change to ");
+            ash_buf_append_cstr(&b, path);
+            tools_result(res, &b, 1);
+            return ASH_OK;
+        }
+        if (accepted != NULL) {
+            newc = accepted;
+            newlen = accepted_len;
+        }
     }
 
     ash_buf final;

@@ -90,5 +90,12 @@ ASH_API const char *ash_edit_apply(ash_arena *a, const char *content,
                                    size_t clen, const ash_edit_spec *edits,
                                    int ne, size_t *out_len, const char **err);
 
+typedef int (*ash_confirm_fn)(void *ud, const char *path,
+                              const char *old, size_t olen,
+                              const char *neu, size_t nlen,
+                              const char **edited, size_t *edited_len);
+
+ASH_API void ash_tools_set_confirm(ash_confirm_fn fn, void *ud);
+
 #endif
 
