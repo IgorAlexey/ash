@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -274,15 +275,75 @@ static int pty_read_until(int mfd, char *out, size_t cap, size_t *got,
     }
 }
 
-static void write_all(int c, const char *p, size_t n)
+enum { SERVE_WRITE_FAILED = 21, SERVE_NO_SIGPIPE = 22 };
+
+static void ignore_sigpipe(void)
+{
+    struct sigaction sa;
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    if (sigaction(SIGPIPE, &sa, NULL) != 0) {
+        int err = errno;
+
+        fprintf(stderr, "  sigaction SIGPIPE: %s\n", strerror(err));
+        _exit(SERVE_NO_SIGPIPE);
+    }
+}
+
+static pid_t fork_checked(void)
+{
+    pid_t pid = fork();
+    int err = errno;
+
+    if (pid < 0) {
+        ash_test_check(0, "fork failed", __FILE__, __LINE__);
+        fprintf(stderr, "  fork: %s\n", strerror(err));
+        exit(ash_test_done());
+    }
+    return pid;
+}
+
+static pid_t fork_server(void)
+{
+    pid_t pid = fork_checked();
+
+    if (pid == 0)
+        ignore_sigpipe();
+    return pid;
+}
+
+static int write_all(int c, const char *p, size_t n)
 {
     size_t off = 0;
+
     while (off < n) {
         ssize_t w = write(c, p + off, n - off);
-        if (w <= 0)
-            break;
-        off += (size_t)w;
+        int err = w < 0 ? errno : EIO;
+
+        if (w > 0) {
+            off += (size_t)w;
+            continue;
+        }
+        if (err == EINTR)
+            continue;
+        fprintf(stderr, "  write to fd %d stopped at %zu of %zu: %s\n",
+                c, off, n, strerror(err));
+        return err;
     }
+    return 0;
+}
+
+static void serve_write(int c, const char *p, size_t n)
+{
+    int err = write_all(c, p, n);
+
+    if (err == 0)
+        return;
+    if (err == EPIPE || err == ECONNRESET)
+        _exit(0);
+    _exit(SERVE_WRITE_FAILED);
 }
 
 static void write_str_all(int c, const char *s)
@@ -358,8 +419,8 @@ static void serve_body(int lfd, const char *body)
                       "Connection: close\r\n\r\n",
                       strlen(body));
     if (hn > 0) {
-        write_all(c, hdr, (size_t)hn);
-        write_all(c, body, strlen(body));
+        serve_write(c, hdr, (size_t)hn);
+        serve_write(c, body, strlen(body));
     }
     close(c);
 }
@@ -379,8 +440,8 @@ static void serve_body_delay(int lfd, const char *body, long ms)
                       "Connection: close\r\n\r\n",
                       strlen(body));
     if (hn > 0) {
-        write_all(c, hdr, (size_t)hn);
-        write_all(c, body, strlen(body));
+        serve_write(c, hdr, (size_t)hn);
+        serve_write(c, body, strlen(body));
     }
     close(c);
 }
@@ -396,8 +457,8 @@ static void serve_hold(int lfd)
         "HTTP/1.1 200 OK\r\n"
         "Content-Type: text/event-stream\r\n"
         "Connection: close\r\n\r\n";
-    write_all(c, hdr, strlen(hdr));
-    write_all(c, HOLD_PREFIX, strlen(HOLD_PREFIX));
+    serve_write(c, hdr, strlen(hdr));
+    serve_write(c, HOLD_PREFIX, strlen(HOLD_PREFIX));
     char tmp[64];
     while (read(c, tmp, sizeof tmp) > 0)
         ;
@@ -415,8 +476,8 @@ static void serve_reset(int lfd)
         "Content-Type: text/event-stream\r\n"
         "Content-Length: 65536\r\n"
         "Connection: close\r\n\r\n";
-    write_all(c, hdr, strlen(hdr));
-    write_all(c, HOLD_PREFIX, strlen(HOLD_PREFIX));
+    serve_write(c, hdr, strlen(hdr));
+    serve_write(c, HOLD_PREFIX, strlen(HOLD_PREFIX));
     struct linger lg = { 1, 0 };
     (void)setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
     close(c);
@@ -443,8 +504,7 @@ static void test_happy(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, HAPPY);
         close(lfd);
@@ -473,8 +533,7 @@ static void test_error(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, ERRBODY);
         close(lfd);
@@ -502,8 +561,7 @@ static void test_cancel(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_hold(lfd);
         close(lfd);
@@ -513,8 +571,7 @@ static void test_cancel(void)
 
     int inp[2];
     ASH_CHECK(pipe(inp) == 0);
-    pid_t wpid = fork();
-    ASH_CHECK(wpid >= 0);
+    pid_t wpid = fork_checked();
     if (wpid == 0) {
         close(inp[0]);
         write_all(inp[1], "hello\r", 6);
@@ -541,8 +598,7 @@ static void test_cancel_same_read(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_body_delay(lfd, HAPPY, 400);
         close(lfd);
@@ -569,8 +625,7 @@ static void paste_cancel_case(const char *seq, size_t n)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_body_delay(lfd, HAPPY, 400);
         close(lfd);
@@ -622,8 +677,7 @@ static void headless_typeahead_case(const char *seq, size_t n)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_body_delay(lfd, HAPPY, 400);
         close(lfd);
@@ -676,8 +730,7 @@ static void test_queue_while_busy(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_body_delay(lfd, HAPPY, 400);
         serve_body(lfd, HAPPY2);
@@ -698,8 +751,7 @@ static void test_queue_while_busy(void)
     char url[64];
     (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
 
-    pid_t lpid = fork();
-    ASH_CHECK(lpid >= 0);
+    pid_t lpid = fork_checked();
     if (lpid == 0) {
         close(mfd);
         ash_loop_cfg cfg = {
@@ -716,8 +768,7 @@ static void test_queue_while_busy(void)
     close(sfd);
     wait_until_raw(mfd);
 
-    pid_t wpid = fork();
-    ASH_CHECK(wpid >= 0);
+    pid_t wpid = fork_checked();
     if (wpid == 0) {
         write_all(mfd, "first\r", 6);
         nap(150);
@@ -764,8 +815,7 @@ static pid_t spawn_loop_pty(const char *url, int *master)
     int sfd = open(sname, O_RDWR | O_NOCTTY);
     ASH_CHECK(sfd >= 0);
 
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_checked();
     if (pid == 0) {
         close(mfd);
         ash_loop_cfg cfg = {
@@ -894,8 +944,7 @@ static void test_transport_error(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_reset(lfd);
         close(lfd);
@@ -924,8 +973,7 @@ static void test_split_escape(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_body(lfd, HAPPY);
         close(lfd);
@@ -935,8 +983,7 @@ static void test_split_escape(void)
 
     int inp[2];
     ASH_CHECK(pipe(inp) == 0);
-    pid_t wpid = fork();
-    ASH_CHECK(wpid >= 0);
+    pid_t wpid = fork_checked();
     if (wpid == 0) {
         close(inp[0]);
         write_all(inp[1], "hi\x1b", 3);
@@ -965,8 +1012,7 @@ static void test_tool(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, TOOL_USE);
         serve_body(lfd, TOOL_FINAL);
@@ -996,8 +1042,7 @@ static void test_tool_multi(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, TOOL_USE);
         serve_body(lfd, TOOL_USE_B);
@@ -1028,8 +1073,7 @@ static void test_tool_parallel(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, TOOL_PARALLEL);
         serve_body(lfd, TOOL_FINAL);
@@ -1061,8 +1105,7 @@ static void test_env_scrub(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, TOOL_ENV);
         serve_body(lfd, TOOL_FINAL);
@@ -1091,8 +1134,7 @@ static void test_tool_survivor(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, TOOL_SURVIVOR);
         serve_body(lfd, TOOL_FINAL);
@@ -1121,8 +1163,7 @@ static void test_tool_bigout(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, TOOL_BIGOUT);
         serve_body(lfd, TOOL_FINAL);
@@ -1170,8 +1211,7 @@ static void test_slash(void)
 {
     int inp[2];
     ASH_CHECK(pipe(inp) == 0);
-    pid_t wpid = fork();
-    ASH_CHECK(wpid >= 0);
+    pid_t wpid = fork_checked();
     if (wpid == 0) {
         close(inp[0]);
         write_all(inp[1], "/help\r", 6);
@@ -1235,8 +1275,7 @@ static void test_session(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, TOOL_USE);
         serve_body(lfd, TOOL_FINAL);
@@ -1287,8 +1326,7 @@ static void test_clear_marker(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t pid = fork();
-    ASH_CHECK(pid >= 0);
+    pid_t pid = fork_server();
     if (pid == 0) {
         serve_body(lfd, HAPPY);
         serve_body(lfd, HAPPY);
@@ -1299,8 +1337,7 @@ static void test_clear_marker(void)
 
     int inp[2];
     ASH_CHECK(pipe(inp) == 0);
-    pid_t wpid = fork();
-    ASH_CHECK(wpid >= 0);
+    pid_t wpid = fork_checked();
     if (wpid == 0) {
         close(inp[0]);
         write_all(inp[1], "one\r", 4);
@@ -1507,8 +1544,7 @@ static void confirm_case(int accept, const char *want)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_body(lfd, body);
         serve_body(lfd, TOOL_FINAL);
@@ -1529,8 +1565,7 @@ static void confirm_case(int accept, const char *want)
     char url[64];
     (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
 
-    pid_t lpid = fork();
-    ASH_CHECK(lpid >= 0);
+    pid_t lpid = fork_checked();
     if (lpid == 0) {
         close(mfd);
         ash_loop_cfg cfg = {
@@ -1547,8 +1582,7 @@ static void confirm_case(int accept, const char *want)
     close(sfd);
     wait_until_raw(mfd);
 
-    pid_t wpid = fork();
-    ASH_CHECK(wpid >= 0);
+    pid_t wpid = fork_checked();
     if (wpid == 0) {
         write_all(mfd, "go\r", 3);
         nap(700);
@@ -1616,8 +1650,7 @@ static void test_modal_leftover(void)
     int port;
     int lfd = listen_loopback(&port);
     ASH_CHECK(lfd >= 0);
-    pid_t spid = fork();
-    ASH_CHECK(spid >= 0);
+    pid_t spid = fork_server();
     if (spid == 0) {
         serve_body(lfd, body);
         close(lfd);
