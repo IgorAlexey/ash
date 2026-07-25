@@ -17,14 +17,42 @@ typedef struct ash_tool_result {
 typedef ash_status (*ash_tool_fn)(ash_arena *out, const ash_json *args,
                                   ash_tool_result *res);
 
+typedef enum ash_tool_kind {
+    ASH_TOOL_PURE = 0,
+    ASH_TOOL_SHELL
+} ash_tool_kind;
+
 typedef struct ash_tool {
-    const char *name;
-    const char *schema;
-    ash_tool_fn run;
+    const char   *name;
+    const char   *schema;
+    ash_tool_kind kind;
+    ash_tool_fn   run;
 } ash_tool;
+
+_Static_assert(sizeof(ash_tool) <= 4 * sizeof(void *),
+               "ash_tool must stay a struct of pointers: ash_tools_register "
+               "copies the struct by value and never copies the bytes behind "
+               "name or schema, so the registrant owns both strings and must "
+               "keep them allocated and unmodified from a successful "
+               "ash_tools_register until its ash_tools_unregister_owner "
+               "returns; a const ash_tool * from ash_tool_find is valid over "
+               "that same window and is invalidated only by the unregister of "
+               "the owner that registered it, never by another owner's; grow "
+               "this struct to carry storage of its own and every one of "
+               "those rules changes");
+
+enum { ASH_TOOLS_EXTRA_CAP = 16 };
+enum { ASH_TOOL_SCHEMA_MAX = 8192 };
+enum { ASH_TOOL_SCHEMA_ARENA = ASH_TOOL_SCHEMA_MAX * 512 };
 
 ASH_API const char     *ash_tools_schema(void);
 ASH_API const ash_tool *ash_tool_find(const char *name);
+
+ASH_API ASH_WUR ash_status ash_tools_register(const ash_tool *borrowed,
+                                              const void *owner);
+ASH_API void ash_tools_unregister_owner(const void *owner);
+ASH_API ASH_WUR ash_status ash_tools_schema_build(ash_arena *a,
+                                                  const char **out);
 
 ASH_API ASH_WUR ash_status ash_tool_dispatch(const ash_tool *t, ash_arena *out,
                                              const char *input, size_t len,

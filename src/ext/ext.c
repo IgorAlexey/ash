@@ -376,7 +376,8 @@ static int ext_get_config(lua_State *L)
         else if (strcmp(key, "theme") == 0)    v = c->theme.value;
         else if (strcmp(key, "system") == 0)   v = c->system.value;
         else if (strcmp(key, "base_url") == 0) v = c->base_url.value;
-        else if (strcmp(key, "thinking") == 0) v = ash_thinking_str(c->thinking);
+        else if (strcmp(key, "thinking") == 0)
+            v = ash_thinking_str(c->thinking);
     }
     if (v)
         lua_pushstring(L, v);
@@ -423,14 +424,23 @@ static int ext_register_tool(lua_State *L)
     if (slot < 0)
         return luaL_error(L, "ash.register_tool: too many tools (max %d)",
                           EXT_MAX_TOOLS);
+
     int ref = luaL_ref(L, LUA_REGISTRYINDEX);
 
     g_slots[slot].tool.name = name_c;
     g_slots[slot].tool.schema = combined;
+    g_slots[slot].tool.kind = ASH_TOOL_PURE;
     g_slots[slot].tool.run = EXT_TRAMPS[slot];
     g_slots[slot].e = e;
     g_slots[slot].cb_ref = ref;
     g_slots[slot].in_use = 1;
+
+    if (ash_tools_register(&g_slots[slot].tool, e) != ASH_OK) {
+        luaL_unref(L, LUA_REGISTRYINDEX, ref);
+        memset(&g_slots[slot], 0, sizeof g_slots[slot]);
+        return luaL_error(L, "ash.register_tool: %s", ash_errbuf);
+    }
+
     ext_tools_push(e, (size_t)slot);
     return 0;
 }
@@ -491,12 +501,9 @@ ash_ext_limits ash_ext_limits_default(void)
 
 static void ext_free(ash_ext *e)
 {
-    for (size_t i = 0; i < e->tool_count; i++) {
-        ext_tool_slot *s = &g_slots[e->tools[i]];
-        s->in_use = 0;
-        s->e = NULL;
-        s->cb_ref = 0;
-    }
+    ash_tools_unregister_owner(e);
+    for (size_t i = 0; i < e->tool_count; i++)
+        memset(&g_slots[e->tools[i]], 0, sizeof g_slots[0]);
     if (e->L)
         lua_close(e->L);
     ash_arena_destroy(&e->alloc.arena);
@@ -553,8 +560,9 @@ ash_status ash_ext_create(ash_ext **out, const ash_ext_limits *lim,
 
 void ash_ext_destroy(ash_ext *e)
 {
-    if (e)
-        ext_free(e);
+    if (e == NULL)
+        return;
+    ext_free(e);
 }
 
 ash_status ash_ext_eval(ash_ext *e, const char *src, size_t len,
@@ -563,7 +571,8 @@ ash_status ash_ext_eval(ash_ext *e, const char *src, size_t len,
     e->instr_used = 0;
     lua_settop(e->L, 0);
 
-    if (luaL_loadbufferx(e->L, src, len, name ? name : "=chunk", "t") != LUA_OK) {
+    const char *chunk = name ? name : "=chunk";
+    if (luaL_loadbufferx(e->L, src, len, chunk, "t") != LUA_OK) {
         const char *msg = lua_tostring(e->L, -1);
         ash_status r = ash_fail(ASH_ERR_PARSE, "lua load: %s",
                                 msg ? msg : "syntax error");
@@ -574,8 +583,9 @@ ash_status ash_ext_eval(ash_ext *e, const char *src, size_t len,
     int st = lua_pcall(e->L, 0, 0, 0);
     if (st != LUA_OK) {
         const char *msg = lua_tostring(e->L, -1);
-        ash_status r = ash_fail(st == LUA_ERRMEM ? ASH_ERR_NOMEM : ASH_ERR_STATE,
-                                "lua: %s", msg ? msg : "runtime error");
+        ash_status code = st == LUA_ERRMEM ? ASH_ERR_NOMEM : ASH_ERR_STATE;
+        ash_status r = ash_fail(code, "lua: %s",
+                                msg ? msg : "runtime error");
         lua_settop(e->L, 0);
         return r;
     }
