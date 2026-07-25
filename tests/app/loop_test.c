@@ -14,6 +14,7 @@
 #include "ash/ai/http.h"
 #include "ash/app/loop.h"
 #include "ash/core/session.h"
+#include "ash/edit/diffview.h"
 #include "ash/term/screen.h"
 #include "ash_test.h"
 
@@ -986,6 +987,209 @@ static void test_bang(void)
     unlink(spath);
 }
 
+static const char CONFIRM_ACCEPT_ENV[] = "ASH_TEST_CONFIRM_ACCEPT";
+static const char CONFIRM_MARK_ENV[] = "ASH_TEST_CONFIRM_MARK";
+
+void ash_diffview_init(ash_diffview *dv, ash_arena *arena, const char *path)
+{
+    memset(dv, 0, sizeof *dv);
+    dv->arena = arena;
+    dv->path = path;
+}
+
+void ash_diffview_set(ash_diffview *dv, const char *old, size_t oldlen,
+                      const char *neu, size_t newlen)
+{
+    (void)dv;
+    (void)old;
+    (void)oldlen;
+    (void)neu;
+    (void)newlen;
+}
+
+void ash_diffview_render(ash_diffview *dv, ash_fb *fb, ash_rect rect,
+                         const ash_diffview_theme *theme)
+{
+    (void)dv;
+    (void)fb;
+    (void)rect;
+    (void)theme;
+}
+
+ash_diffview_action ash_diffview_key(ash_diffview *dv, ash_key k, int view_h)
+{
+    (void)dv;
+    (void)k;
+    (void)view_h;
+    const char *mark = getenv(CONFIRM_MARK_ENV);
+    if (mark != NULL) {
+        int fd = open(mark, O_WRONLY | O_APPEND);
+        if (fd >= 0) {
+            write_all(fd, "k", 1);
+            close(fd);
+        }
+    }
+    const char *accept = getenv(CONFIRM_ACCEPT_ENV);
+    return accept != NULL && accept[0] == '1' ? ASH_DIFFVIEW_ACCEPT
+                                              : ASH_DIFFVIEW_REJECT;
+}
+
+static size_t slurp(const char *path, char *out, size_t cap)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0)
+        return 0;
+    ssize_t n = read(fd, out, cap - 1);
+    close(fd);
+    if (n < 0)
+        n = 0;
+    out[n] = 0;
+    return (size_t)n;
+}
+
+static void edit_body(char *out, size_t cap, const char *path)
+{
+    (void)snprintf(out, cap,
+        "event: message_start\n"
+        "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n"
+        "\n"
+        "event: content_block_start\n"
+        "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":"
+        "{\"type\":\"tool_use\",\"id\":\"toolu_ed\",\"name\":\"edit\",\"input\":{}}}\n"
+        "\n"
+        "event: content_block_delta\n"
+        "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+        "{\"type\":\"input_json_delta\",\"partial_json\":"
+        "\"{\\\"path\\\": \\\"%s\\\", \\\"oldText\\\": \\\"alpha\\\", "
+        "\\\"newText\\\": \\\"gamma\\\"}\"}}\n"
+        "\n"
+        "event: message_delta\n"
+        "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n"
+        "\n"
+        "event: message_stop\n"
+        "data: {\"type\":\"message_stop\"}\n"
+        "\n", path);
+}
+
+static void confirm_case(int accept, const char *want)
+{
+    char path[] = "/tmp/ash-confirm-XXXXXX";
+    int tfd = mkstemp(path);
+    ASH_CHECK(tfd >= 0);
+    if (tfd < 0)
+        return;
+    write_all(tfd, "alpha\n", 6);
+    close(tfd);
+
+    char mark[] = "/tmp/ash-confirm-key-XXXXXX";
+    int kfd = mkstemp(mark);
+    ASH_CHECK(kfd >= 0);
+    if (kfd < 0) {
+        unlink(path);
+        return;
+    }
+    close(kfd);
+
+    setenv(CONFIRM_ACCEPT_ENV, accept ? "1" : "0", 1);
+    setenv(CONFIRM_MARK_ENV, mark, 1);
+
+    static char body[4096];
+    edit_body(body, sizeof body, path);
+
+    int port;
+    int lfd = listen_loopback(&port);
+    ASH_CHECK(lfd >= 0);
+    pid_t spid = fork();
+    ASH_CHECK(spid >= 0);
+    if (spid == 0) {
+        serve_body(lfd, body);
+        serve_body(lfd, TOOL_FINAL);
+        close(lfd);
+        _exit(0);
+    }
+    close(lfd);
+
+    int mfd = posix_openpt(O_RDWR | O_NOCTTY);
+    ASH_CHECK(mfd >= 0);
+    ASH_CHECK(grantpt(mfd) == 0);
+    ASH_CHECK(unlockpt(mfd) == 0);
+    const char *sname = ptsname(mfd);
+    ASH_CHECK(sname != NULL);
+    int sfd = open(sname, O_RDWR | O_NOCTTY);
+    ASH_CHECK(sfd >= 0);
+
+    char url[64];
+    (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+
+    pid_t lpid = fork();
+    ASH_CHECK(lpid >= 0);
+    if (lpid == 0) {
+        close(mfd);
+        ash_loop_cfg cfg = {
+            .url = url, .api_key = "k", .model = "claude-x", .max_tokens = 64,
+        };
+        if (ash_screen_init(sfd) == ASH_OK) {
+            ash_status st = ash_loop_run(&cfg, sfd, sfd);
+            (void)st;
+            ash_screen_shutdown();
+        }
+        close(sfd);
+        _exit(0);
+    }
+    close(sfd);
+
+    pid_t wpid = fork();
+    ASH_CHECK(wpid >= 0);
+    if (wpid == 0) {
+        write_all(mfd, "go\r", 3);
+        nap(700);
+        write_all(mfd, "y", 1);
+        nap(700);
+        write_all(mfd, "\x03", 1);
+        nap(200);
+        write_all(mfd, "\x03", 1);
+        nap(200);
+        _exit(0);
+    }
+
+    static char out[1 << 18];
+    size_t got = 0;
+    for (;;) {
+        ssize_t r = read(mfd, out + got, sizeof out - 1 - got);
+        if (r <= 0)
+            break;
+        got += (size_t)r;
+        if (got >= sizeof out - 1)
+            break;
+    }
+    close(mfd);
+
+    (void)waitpid(wpid, NULL, 0);
+    (void)waitpid(lpid, NULL, 0);
+    (void)waitpid(spid, NULL, 0);
+
+    char keys[64];
+    ASH_CHECK(slurp(mark, keys, sizeof keys) > 0);
+    char content[256];
+    (void)slurp(path, content, sizeof content);
+    ASH_CHECK_STREQ(content, want);
+
+    unlink(mark);
+    unlink(path);
+    unsetenv(CONFIRM_ACCEPT_ENV);
+    unsetenv(CONFIRM_MARK_ENV);
+}
+
+static void test_confirm_reject(void)
+{
+    confirm_case(0, "alpha\n");
+}
+
+static void test_confirm_accept(void)
+{
+    confirm_case(1, "gamma\n");
+}
+
 int main(void)
 {
     ASH_CHECK(ash_http_global_init() == ASH_OK);
@@ -1005,6 +1209,8 @@ int main(void)
     test_one_screen();
     test_session();
     test_clear_marker();
+    test_confirm_reject();
+    test_confirm_accept();
     ash_http_global_cleanup();
     return ash_test_done();
 }

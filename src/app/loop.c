@@ -26,6 +26,8 @@
 #include "ash/core/proc.h"
 #include "ash/core/session.h"
 #include "ash/core/settings.h"
+#include "ash/edit/diffview.h"
+#include "ash/edit/editor.h"
 #include "ash/fb/fb.h"
 #include "ash/fb/scrollback.h"
 #include "ash/term/input.h"
@@ -140,6 +142,9 @@ struct ash_loop {
     ash_queue        queue;
     ash_arena        q_arena;
     int              drain_suspended;
+
+    ash_arena        modal_arena;
+    int              has_modal_arena;
 };
 
 enum { SEL_CLICK_MS = 400 };
@@ -1094,6 +1099,111 @@ out:
     ash_arena_destroy(&s.edit);
 }
 
+static ash_diffview_theme confirm_theme(const ash_theme *t)
+{
+    ash_style add = t->tool_head;
+    ash_style del = t->error;
+    del.attr = (uint16_t)(del.attr | ASH_ATTR_BOLD);
+    ash_diffview_theme d = { .context = t->text, .add = add, .del = del,
+                             .gutter = t->marker, .header = t->user_msg,
+                             .hint = t->user_msg };
+    return d;
+}
+
+static ash_diffview_action run_diffview(struct ash_loop *L, ash_diffview *dv)
+{
+    ash_diffview_theme th = confirm_theme(L->theme);
+    ash_arena_mark mk = ash_arena_mark_get(&L->modal_arena);
+    modal_pump p;
+    modal_pump_init(&p);
+    for (;;) {
+        int w, h;
+        term_size(L, &w, &h);
+        ash_arena_rewind(&L->modal_arena, mk);
+        ash_fb_begin(&L->fb, w, h);
+        ash_diffview_render(dv, &L->fb, (ash_rect){ 0, 0, w, h }, &th);
+        frame_emit(L);
+
+        const ash_input_event *ev = modal_pump_next(L, &p);
+        if (ev == NULL)
+            return ASH_DIFFVIEW_REJECT;
+        if (ev->kind != ASH_EV_KEY)
+            continue;
+        ash_diffview_action a = ash_diffview_key(dv, ash_key_map(ev), h);
+        if (a != ASH_DIFFVIEW_NONE)
+            return a;
+    }
+}
+
+static int run_editor(struct ash_loop *L, ash_editor *ed)
+{
+    modal_pump p;
+    modal_pump_init(&p);
+    for (;;) {
+        int w, h;
+        term_size(L, &w, &h);
+        ash_fb_begin(&L->fb, w, h);
+        ash_editor_render(ed, &L->fb, (ash_rect){ 0, 0, w, h }, L->st_text,
+                          ash_selection_style());
+        frame_emit(L);
+
+        const ash_input_event *ev = modal_pump_next(L, &p);
+        if (ev == NULL)
+            return 0;
+        if (ev->kind != ASH_EV_KEY)
+            continue;
+        ash_key k = ash_key_map(ev);
+        if (k.cmd == ASH_EC_SUBMIT)
+            return 1;
+        if (k.cmd == ASH_EC_CANCEL || k.cmd == ASH_EC_EOF)
+            return 0;
+        ash_editor_apply(ed, k);
+    }
+}
+
+static int loop_confirm(void *ud, const char *path, const char *old,
+                        size_t olen, const char *neu, size_t nlen,
+                        const char **edited, size_t *edited_len)
+{
+    struct ash_loop *L = ud;
+    ash_arena_reset(&L->modal_arena);
+
+    ash_diffview dv;
+    ash_diffview_init(&dv, &L->modal_arena, path);
+    ash_diffview_set(&dv, old, olen, neu, nlen);
+    ash_arena_mark mk = ash_arena_mark_get(&L->modal_arena);
+
+    L->modal_open = 1;
+    int accepted = 0;
+    for (;;) {
+        ash_arena_rewind(&L->modal_arena, mk);
+        ash_diffview_action a = run_diffview(L, &dv);
+        if (a == ASH_DIFFVIEW_ACCEPT) {
+            *edited = neu;
+            *edited_len = nlen;
+            accepted = 1;
+            break;
+        }
+        if (a != ASH_DIFFVIEW_EDIT)
+            break;
+
+        ash_editor ed;
+        ash_editor_init(&ed, &L->modal_arena);
+        ash_editor_set_text(&ed, neu, nlen);
+        if (!run_editor(L, &ed))
+            continue;
+        ash_buf text;
+        ash_buf_init(&text, &L->mem.turn);
+        ash_editor_text(&ed, &text);
+        *edited = text.len > 0 ? (const char *)text.data : "";
+        *edited_len = text.len;
+        accepted = 1;
+        break;
+    }
+    L->modal_open = 0;
+    return accepted;
+}
+
 enum { LOGIN_OK, LOGIN_EOF, LOGIN_CANCEL };
 
 static int login_read(ash_co *co, struct ash_loop *L)
@@ -1519,6 +1629,12 @@ ash_status ash_loop_run(const ash_loop_cfg *cfg, int in_fd, int out_fd)
         L->drain_suspended = 0;
         ash_textarea_init(&L->ta, &L->ui, L->wrap_w > 0 ? L->wrap_w : 80, 0);
     }
+    if (L->tui && ash_arena_create(&L->modal_arena, "modal", 1u << 20)
+            == ASH_OK) {
+        L->has_modal_arena = 1;
+        ash_tools_set_confirm(loop_confirm, L);
+    }
+
     ash_arena logarena;
     L->has_log = 0;
     if (cfg->session_path != NULL &&
@@ -1539,6 +1655,10 @@ ash_status ash_loop_run(const ash_loop_cfg *cfg, int in_fd, int out_fd)
     if (L->has_log) {
         ash_log_close(&L->log);
         ash_arena_destroy(&logarena);
+    }
+    if (L->has_modal_arena) {
+        ash_tools_set_confirm(NULL, NULL);
+        ash_arena_destroy(&L->modal_arena);
     }
     if (L->tui) {
         ash_arena_destroy(&L->q_arena);

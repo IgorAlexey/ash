@@ -196,7 +196,7 @@ add_executable(loop_test app/loop_test.c
   ${CMAKE_SOURCE_DIR}/src/term/screen.c
   ${CMAKE_SOURCE_DIR}/src/term/signals.c)
 target_include_directories(loop_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(loop_test PRIVATE ash_tools ash_ui)
+target_link_libraries(loop_test PRIVATE ash_tools ash_ui ash_edit)
 add_test(NAME loop_test COMMAND loop_test)
 
 add_executable(bang_test app/bang_test.c
