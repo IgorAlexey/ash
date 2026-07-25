@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <termios.h>
 #include <time.h>
@@ -275,6 +276,7 @@ static int pty_read_until(int mfd, char *out, size_t cap, size_t *got,
     }
 }
 
+enum { SERVE_TIMEOUT_S = 30 };
 enum { SERVE_WRITE_FAILED = 21, SERVE_NO_SIGPIPE = 22 };
 
 static void ignore_sigpipe(void)
@@ -395,7 +397,9 @@ static int listen_loopback(int *port)
     if (lfd < 0)
         return -1;
     int one = 1;
+    struct timeval rcv = { SERVE_TIMEOUT_S, 0 };
     (void)setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
+    (void)setsockopt(lfd, SOL_SOCKET, SO_RCVTIMEO, &rcv, sizeof rcv);
     struct sockaddr_in addr;
     memset(&addr, 0, sizeof addr);
     addr.sin_family = AF_INET;
