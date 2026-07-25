@@ -112,6 +112,7 @@ struct ash_loop {
     ash_footer       footer;
 
     int              tui;
+    int              modal_open;
     ash_arena        ui;
     ash_fb           fb;
     ash_scrollback   sb;
@@ -305,7 +306,7 @@ static void draw_cells(ash_fb *fb, int y, const ash_cell *cells, size_t n)
 
 static void tui_draw(struct ash_loop *L)
 {
-    if (!L->tui)
+    if (!L->tui || L->modal_open)
         return;
 
     int w, h;
@@ -917,23 +918,108 @@ static int line_is(const struct ash_loop *L, const char *cmd)
     return len == n && memcmp(L->line.data, cmd, n) == 0;
 }
 
+enum { MODAL_SETTLE_MAX = 32 };
+
+static void frame_emit(struct ash_loop *L)
+{
+    L->frame.len = 0;
+    ash_fb_flip(&L->fb, &L->frame);
+    if (L->frame.len == 0)
+        return;
+    ash_screen_frame_begin();
+    ash_screen_write(L->frame.data, L->frame.len);
+    ash_screen_frame_end();
+}
+
+typedef struct modal_pump {
+    ash_input_event evs[32];
+    uint32_t        produced;
+    uint32_t        cursor;
+    size_t          off;
+} modal_pump;
+
+static void modal_pump_init(modal_pump *p)
+{
+    p->produced = 0;
+    p->cursor = 0;
+    p->off = 0;
+}
+
+static const ash_input_event *modal_pump_next(struct ash_loop *L, modal_pump *p)
+{
+    for (;;) {
+        if (p->cursor < p->produced)
+            return &p->evs[p->cursor++];
+        if (p->off >= L->inlen) {
+            L->inlen = 0;
+            ash_co_yield(&L->co, ASH_WAIT_INPUT);
+            if (L->inlen == 0)
+                return NULL;
+            p->off = 0;
+        }
+        uint32_t consumed = 0;
+        p->produced = 0;
+        p->cursor = 0;
+        if (ash_input_feed(&L->dfa, L->inbuf + p->off,
+                           (uint32_t)(L->inlen - p->off), p->evs, 32, &consumed,
+                           &p->produced) != ASH_OK || consumed == 0)
+            p->off = L->inlen;
+        else
+            p->off += consumed;
+    }
+}
+
+typedef void (*ash_modal_fn)(ash_ctx *c, void *ud);
+
+static void modal_frame(struct ash_loop *L, ash_tui *t, ash_modal_fn draw,
+                        void *ud, const ash_input_event *ev)
+{
+    int w, h;
+    term_size(L, &w, &h);
+
+    int guard = 0;
+    do {
+        ash_ctx *c = ash_tui_begin(t, w, h, ev);
+        if (draw != NULL)
+            draw(c, ud);
+        ash_tui_end(c);
+        ev = NULL;
+    } while (ash_tui_settling(t) && ++guard < MODAL_SETTLE_MAX);
+
+    ash_fb_begin(&L->fb, w, h);
+    ash_tui_render(t, &L->fb);
+    frame_emit(L);
+}
+
+static void run_modal(struct ash_loop *L, ash_tui *t, ash_modal_fn draw,
+                      void *ud, const int *closed)
+{
+    L->modal_open = 1;
+    modal_frame(L, t, draw, ud, NULL);
+
+    modal_pump p;
+    modal_pump_init(&p);
+    while (!*closed) {
+        const ash_input_event *ev = modal_pump_next(L, &p);
+        if (ev == NULL)
+            break;
+        modal_frame(L, t, draw, ud, ev);
+    }
+
+    modal_frame(L, t, NULL, NULL, NULL);
+    L->modal_open = 0;
+}
+
 enum { SETTINGS_MAX_FIELDS = 16 };
 
 struct settings_run {
-    struct ash_loop   *L;
-    ash_tui            tui;
-    ash_fb             fb;
-    ash_input          dfa;
-    ash_arena          ui;
+    ash_arena          edit;
     ash_arena          cfgar;
-    ash_arena          frame;
     ash_config         cfg;
     const ash_setting *schema;
     size_t             nf;
     ash_sm_field       fields[SETTINGS_MAX_FIELDS];
     ash_settings_modal m;
-    int                w;
-    int                h;
 };
 
 static void settings_build_fields(struct settings_run *s)
@@ -949,123 +1035,63 @@ static void settings_build_fields(struct settings_run *s)
     }
 }
 
-static void settings_frame(struct settings_run *s, const ash_input_event *ev)
+static void settings_draw(ash_ctx *c, void *ud)
 {
-    int guard = 0;
-    do {
-        ash_ctx *c = ash_tui_begin(&s->tui, s->w, s->h, ev);
-        ash_settings_modal_draw(c, &s->m);
-        ash_tui_end(c);
-        ev = NULL;
-    } while (ash_tui_settling(&s->tui) && ++guard < 32);
+    struct settings_run *s = ud;
+    ash_settings_modal_draw(c, &s->m);
+    if (!s->m.commit)
+        return;
 
-    if (s->m.commit) {
-        ash_config_layer layer = s->m.project_scope ? ASH_CFG_PROJECT
-                                                    : ASH_CFG_GLOBAL;
-        ash_status st = ash_settings_write(&s->cfg, layer,
-                                           &s->schema[s->m.commit_index],
-                                           s->m.commit_value);
-        s->m.commit = 0;
-        if (st == ASH_OK) {
-            ash_arena_reset(&s->cfgar);
-            if (ash_config_load(&s->cfgar, &s->cfg) == ASH_OK)
-                settings_build_fields(s);
-            s->m.status = "saved";
-        } else {
-            s->m.status = "write failed";
-        }
+    ash_config_layer layer = s->m.project_scope ? ASH_CFG_PROJECT
+                                                : ASH_CFG_GLOBAL;
+    ash_status st = ash_settings_write(&s->cfg, layer,
+                                       &s->schema[s->m.commit_index],
+                                       s->m.commit_value);
+    s->m.commit = 0;
+    if (st != ASH_OK) {
+        s->m.status = "write failed";
+        return;
     }
-
-    ash_arena_reset(&s->frame);
-    ash_fb_begin(&s->fb, s->w, s->h);
-    ash_tui_render(&s->tui, &s->fb);
-    ash_buf out;
-    ash_buf_init(&out, &s->frame);
-    ash_fb_flip(&s->fb, &out);
-    write_bytes(s->L, out.data, out.len);
+    ash_arena_reset(&s->cfgar);
+    if (ash_config_load(&s->cfgar, &s->cfg) == ASH_OK)
+        settings_build_fields(s);
+    s->m.status = "saved";
 }
 
 static void run_settings(struct ash_loop *L)
 {
-    struct settings_run sr;
-    struct settings_run *s = &sr;
-    memset(s, 0, sizeof *s);
-    s->L = L;
+    if (!L->tui) {
+        ui_block_str(L, ASH_TS_INFO, "settings unavailable: not a terminal\n");
+        return;
+    }
 
-    if (ash_arena_create(&s->ui, "settings-ui", 1u << 18) != ASH_OK)
+    struct settings_run s;
+    ash_tui t;
+    memset(&s, 0, sizeof s);
+
+    if (ash_arena_create(&s.edit, "settings-edit", 1u << 18) != ASH_OK)
         return;
-    if (ash_arena_create(&s->cfgar, "settings-cfg", 1u << 16) != ASH_OK) {
-        ash_arena_destroy(&s->ui);
+    if (ash_arena_create(&s.cfgar, "settings-cfg", 1u << 16) != ASH_OK) {
+        ash_arena_destroy(&s.edit);
         return;
     }
-    if (ash_arena_create(&s->frame, "settings-frame", 1u << 16) != ASH_OK) {
-        ash_arena_destroy(&s->cfgar);
-        ash_arena_destroy(&s->ui);
-        return;
-    }
-    if (ash_config_load(&s->cfgar, &s->cfg) != ASH_OK)
+    if (ash_config_load(&s.cfgar, &s.cfg) != ASH_OK)
         goto out;
 
-    s->schema = ash_settings_schema(&s->nf);
-    if (s->nf > SETTINGS_MAX_FIELDS)
-        s->nf = SETTINGS_MAX_FIELDS;
-    settings_build_fields(s);
-    ash_settings_modal_init(&s->m, s->fields, (int)s->nf, &s->ui);
+    s.schema = ash_settings_schema(&s.nf);
+    if (s.nf > SETTINGS_MAX_FIELDS)
+        s.nf = SETTINGS_MAX_FIELDS;
+    settings_build_fields(&s);
+    ash_settings_modal_init(&s.m, s.fields, (int)s.nf, &s.edit);
 
-    if (ash_tui_init(&s->tui) != ASH_OK)
+    if (ash_tui_init(&t) != ASH_OK)
         goto out;
-    ash_style def = { ASH_RGBA_DEFAULT, ASH_RGBA_DEFAULT, 0 };
-    ash_fb_init(&s->fb, &s->ui, def);
-    ash_input_init(&s->dfa);
-
-    s->w = 80;
-    s->h = 24;
-    struct winsize ws;
-    if (ioctl(L->out_fd, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0) {
-        s->w = ws.ws_col;
-        s->h = ws.ws_row;
-    }
-
-    settings_frame(s, NULL);
-    while (!s->m.closed) {
-        uint8_t buf[512];
-        ssize_t rn;
-        do {
-            rn = read(L->in_fd, buf, sizeof buf);
-        } while (rn < 0 && errno == EINTR);
-        if (rn <= 0)
-            break;
-
-        uint32_t off = 0;
-        while (off < (uint32_t)rn && !s->m.closed) {
-            ash_input_event evs[32];
-            uint32_t consumed = 0, produced = 0;
-            if (ash_input_feed(&s->dfa, buf + off, (uint32_t)rn - off, evs, 32,
-                               &consumed, &produced) != ASH_OK)
-                break;
-            if (consumed == 0)
-                break;
-            off += consumed;
-            for (uint32_t i = 0; i < produced && !s->m.closed; i++)
-                settings_frame(s, &evs[i]);
-        }
-    }
-
-    ash_ctx *blank = ash_tui_begin(&s->tui, s->w, s->h, NULL);
-    ash_tui_end(blank);
-    ash_arena_reset(&s->frame);
-    ash_fb_begin(&s->fb, s->w, s->h);
-    ash_tui_render(&s->tui, &s->fb);
-    ash_buf clear;
-    ash_buf_init(&clear, &s->frame);
-    ash_fb_flip(&s->fb, &clear);
-    write_bytes(L, clear.data, clear.len);
-    ash_tui_destroy(&s->tui);
+    run_modal(L, &t, settings_draw, &s, &s.m.closed);
+    ash_tui_destroy(&t);
 
 out:
-    ash_arena_destroy(&s->frame);
-    ash_arena_destroy(&s->cfgar);
-    ash_arena_destroy(&s->ui);
+    ash_arena_destroy(&s.cfgar);
+    ash_arena_destroy(&s.edit);
 }
 
 enum { LOGIN_OK, LOGIN_EOF, LOGIN_CANCEL };
