@@ -19,6 +19,7 @@
 #include "ash/base/buf.h"
 #include "ash/base/json.h"
 #include "ash/base/slice.h"
+#include "ash/base/status.h"
 #include "ash/core/auth.h"
 #include "ash/core/config.h"
 #include "ash/core/coro.h"
@@ -160,7 +161,8 @@ enum { QUEUE_ROWS_MAX = 6 };
 static int64_t mono_ms(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
+        ash_die("clock_gettime(CLOCK_MONOTONIC) failed");
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
