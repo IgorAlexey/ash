@@ -11,80 +11,6 @@
 #include "ash/base/slice.h"
 #include "ash/base/poison.h"
 
-static size_t utf8_seq_len(const unsigned char *p, size_t n)
-{
-    if (n == 0)
-        return 0;
-    unsigned char c = p[0];
-    if (c < 0x80)
-        return 1;
-    size_t len;
-    unsigned char lo = 0x80, hi = 0xbf;
-    if (c >= 0xc2 && c <= 0xdf) {
-        len = 2;
-    } else if (c >= 0xe0 && c <= 0xef) {
-        len = 3;
-        if (c == 0xe0)
-            lo = 0xa0;
-        else if (c == 0xed)
-            hi = 0x9f;
-    } else if (c >= 0xf0 && c <= 0xf4) {
-        len = 4;
-        if (c == 0xf0)
-            lo = 0x90;
-        else if (c == 0xf4)
-            hi = 0x8f;
-    } else {
-        return 0;
-    }
-    if (n < len)
-        return 0;
-    if (p[1] < lo || p[1] > hi)
-        return 0;
-    for (size_t i = 2; i < len; i++)
-        if (p[i] < 0x80 || p[i] > 0xbf)
-            return 0;
-    return len;
-}
-
-static void esc_bytes(ash_buf *b, const char *p, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)p[i];
-        switch (c) {
-        case '"':  ash_buf_append(b, "\\\"", 2); break;
-        case '\\': ash_buf_append(b, "\\\\", 2); break;
-        case '\n': ash_buf_append(b, "\\n", 2); break;
-        case '\r': ash_buf_append(b, "\\r", 2); break;
-        case '\t': ash_buf_append(b, "\\t", 2); break;
-        case '\b': ash_buf_append(b, "\\b", 2); break;
-        case '\f': ash_buf_append(b, "\\f", 2); break;
-        default:
-            if (c < 0x20) {
-                char u[8];
-                int k = snprintf(u, sizeof u, "\\u%04x", c);
-                if (k > 0)
-                    ash_buf_append(b, u, (size_t)k);
-            } else if (c < 0x80) {
-                ash_buf_append_byte(b, c);
-            } else {
-                size_t len = utf8_seq_len((const unsigned char *)p + i, n - i);
-                if (len > 0) {
-                    ash_buf_append(b, p + i, len);
-                    i += len - 1;
-                } else {
-                    ash_buf_append(b, "\\ufffd", 6);
-                }
-            }
-        }
-    }
-}
-
-static void esc(ash_buf *b, const char *s)
-{
-    esc_bytes(b, s, strlen(s));
-}
-
 static void emit_json(ash_buf *b, const ash_json *v)
 {
     switch (v->type) {
@@ -98,9 +24,7 @@ static void emit_json(ash_buf *b, const ash_json *v)
         ash_buf_append(b, v->u.num.p, v->u.num.n);
         break;
     case ASH_JSON_STRING:
-        ash_buf_append_byte(b, '"');
-        esc_bytes(b, v->u.str.p, v->u.str.n);
-        ash_buf_append_byte(b, '"');
+        ash_json_quote(b, v->u.str.p, v->u.str.n);
         break;
     case ASH_JSON_ARRAY:
         ash_buf_append_byte(b, '[');
@@ -117,9 +41,8 @@ static void emit_json(ash_buf *b, const ash_json *v)
             const ash_json_member *m = &v->u.obj.v[i];
             if (i)
                 ash_buf_append_byte(b, ',');
-            ash_buf_append_byte(b, '"');
-            esc_bytes(b, m->key, m->klen);
-            ash_buf_append_cstr(b, "\":");
+            ash_json_quote(b, m->key, m->klen);
+            ash_buf_append_byte(b, ':');
             emit_json(b, &m->val);
         }
         ash_buf_append_byte(b, '}');
@@ -140,24 +63,23 @@ static void append_block(ash_buf *b, const ash_msg *m)
     assert(!(m->tool_name != NULL && m->tool_result != NULL));
     if (m->tool_name != NULL) {
         if (m->content != NULL && m->content[0] != 0) {
-            ash_buf_append_cstr(b, "{\"type\":\"text\",\"text\":\"");
-            esc(b, m->content);
-            ash_buf_append_cstr(b, "\"},");
+            ash_buf_append_cstr(b, "{\"type\":\"text\",\"text\":");
+            ash_json_quote_cstr(b, m->content);
+            ash_buf_append_cstr(b, "},");
         }
-        ash_buf_append_cstr(b, "{\"type\":\"tool_use\",\"id\":\"");
-        esc(b, m->tool_id ? m->tool_id : "");
-        ash_buf_append_cstr(b, "\",\"name\":\"");
-        esc(b, m->tool_name);
-        ash_buf_append_cstr(b, "\",\"input\":");
+        ash_buf_append_cstr(b, "{\"type\":\"tool_use\",\"id\":");
+        ash_json_quote_cstr(b, m->tool_id ? m->tool_id : "");
+        ash_buf_append_cstr(b, ",\"name\":");
+        ash_json_quote_cstr(b, m->tool_name);
+        ash_buf_append_cstr(b, ",\"input\":");
         ash_buf_append_cstr(b, m->tool_input ? m->tool_input : "{}");
         ash_buf_append_byte(b, '}');
         return;
     }
-    ash_buf_append_cstr(b, "{\"type\":\"tool_result\",\"tool_use_id\":\"");
-    esc(b, m->tool_id ? m->tool_id : "");
-    ash_buf_append_cstr(b, "\",\"content\":\"");
-    esc(b, m->tool_result);
-    ash_buf_append_byte(b, '"');
+    ash_buf_append_cstr(b, "{\"type\":\"tool_result\",\"tool_use_id\":");
+    ash_json_quote_cstr(b, m->tool_id ? m->tool_id : "");
+    ash_buf_append_cstr(b, ",\"content\":");
+    ash_json_quote_cstr(b, m->tool_result);
     if (m->tool_is_error)
         ash_buf_append_cstr(b, ",\"is_error\":true");
     ash_buf_append_byte(b, '}');
@@ -189,15 +111,14 @@ static ash_provider_kind cfg_kind(const ash_provider_cfg *cfg)
 static void build_body_anthropic(ash_buf *b, const ash_provider_cfg *cfg,
                                  const ash_msg *msgs, size_t nmsgs)
 {
-    ash_buf_append_cstr(b, "{\"model\":\"");
-    esc(b, cfg->model);
-    ash_buf_append_cstr(b, "\",\"max_tokens\":");
+    ash_buf_append_cstr(b, "{\"model\":");
+    ash_json_quote_cstr(b, cfg->model);
+    ash_buf_append_cstr(b, ",\"max_tokens\":");
     append_int(b, cfg->max_tokens > 0 ? cfg->max_tokens : 1024);
     ash_buf_append_cstr(b, ",\"stream\":true");
     if (cfg->system != NULL) {
-        ash_buf_append_cstr(b, ",\"system\":\"");
-        esc(b, cfg->system);
-        ash_buf_append_byte(b, '"');
+        ash_buf_append_cstr(b, ",\"system\":");
+        ash_json_quote_cstr(b, cfg->system);
     }
     if (cfg->tools != NULL) {
         ash_buf_append_cstr(b, ",\"tools\":");
@@ -211,13 +132,11 @@ static void build_body_anthropic(ash_buf *b, const ash_provider_cfg *cfg,
         if (!first)
             ash_buf_append_byte(b, ',');
         first = 0;
-        ash_buf_append_cstr(b, "{\"role\":\"");
-        esc(b, m->role ? m->role : "user");
-        ash_buf_append_cstr(b, "\",\"content\":");
+        ash_buf_append_cstr(b, "{\"role\":");
+        ash_json_quote_cstr(b, m->role ? m->role : "user");
+        ash_buf_append_cstr(b, ",\"content\":");
         if (!msg_is_block(m)) {
-            ash_buf_append_byte(b, '"');
-            esc(b, m->content ? m->content : "");
-            ash_buf_append_byte(b, '"');
+            ash_json_quote_cstr(b, m->content ? m->content : "");
             i++;
         } else {
             ash_buf_append_byte(b, '[');
@@ -256,15 +175,13 @@ static void build_openai_tools(ash_buf *b, const char *tools_json)
         if (wrote)
             ash_buf_append_byte(b, ',');
         wrote = 1;
-        ash_buf_append_cstr(b, "{\"type\":\"function\",\"function\":{\"name\":\"");
-        esc_bytes(b, ns.p, ns.len);
-        ash_buf_append_byte(b, '"');
+        ash_buf_append_cstr(b, "{\"type\":\"function\",\"function\":{\"name\":");
+        ash_json_quote(b, ns.p, ns.len);
         const ash_json *desc = ash_json_get(t, "description");
         ash_slice ds;
         if (desc != NULL && ash_json_str(desc, &ds) == ASH_OK) {
-            ash_buf_append_cstr(b, ",\"description\":\"");
-            esc_bytes(b, ds.p, ds.len);
-            ash_buf_append_byte(b, '"');
+            ash_buf_append_cstr(b, ",\"description\":");
+            ash_json_quote(b, ds.p, ds.len);
         }
         ash_buf_append_cstr(b, ",\"parameters\":");
         const ash_json *schema = ash_json_get(t, "input_schema");
@@ -279,13 +196,13 @@ static void build_openai_tools(ash_buf *b, const char *tools_json)
 
 static void append_openai_call(ash_buf *b, const ash_msg *m)
 {
-    ash_buf_append_cstr(b, "{\"id\":\"");
-    esc(b, m->tool_id ? m->tool_id : "");
-    ash_buf_append_cstr(b, "\",\"type\":\"function\",\"function\":{\"name\":\"");
-    esc(b, m->tool_name);
-    ash_buf_append_cstr(b, "\",\"arguments\":\"");
-    esc(b, m->tool_input ? m->tool_input : "{}");
-    ash_buf_append_cstr(b, "\"}}");
+    ash_buf_append_cstr(b, "{\"id\":");
+    ash_json_quote_cstr(b, m->tool_id ? m->tool_id : "");
+    ash_buf_append_cstr(b, ",\"type\":\"function\",\"function\":{\"name\":");
+    ash_json_quote_cstr(b, m->tool_name);
+    ash_buf_append_cstr(b, ",\"arguments\":");
+    ash_json_quote_cstr(b, m->tool_input ? m->tool_input : "{}");
+    ash_buf_append_cstr(b, "}}");
 }
 
 static int same_role_calls(const ash_msg *a, const ash_msg *b)
@@ -300,9 +217,9 @@ static int same_role_calls(const ash_msg *a, const ash_msg *b)
 static void build_body_openai(ash_buf *b, const ash_provider_cfg *cfg,
                               const ash_msg *msgs, size_t nmsgs)
 {
-    ash_buf_append_cstr(b, "{\"model\":\"");
-    esc(b, cfg->model);
-    ash_buf_append_cstr(b, "\",\"max_tokens\":");
+    ash_buf_append_cstr(b, "{\"model\":");
+    ash_json_quote_cstr(b, cfg->model);
+    ash_buf_append_cstr(b, ",\"max_tokens\":");
     append_int(b, cfg->max_tokens > 0 ? cfg->max_tokens : 1024);
     ash_buf_append_cstr(b, ",\"stream\":true");
     ash_buf_append_cstr(b, ",\"stream_options\":{\"include_usage\":true}");
@@ -313,9 +230,9 @@ static void build_body_openai(ash_buf *b, const ash_provider_cfg *cfg,
     ash_buf_append_cstr(b, ",\"messages\":[");
     int wrote = 0;
     if (cfg->system != NULL) {
-        ash_buf_append_cstr(b, "{\"role\":\"system\",\"content\":\"");
-        esc(b, cfg->system);
-        ash_buf_append_cstr(b, "\"}");
+        ash_buf_append_cstr(b, "{\"role\":\"system\",\"content\":");
+        ash_json_quote_cstr(b, cfg->system);
+        ash_buf_append_byte(b, '}');
         wrote = 1;
     }
     size_t i = 0;
@@ -326,13 +243,11 @@ static void build_body_openai(ash_buf *b, const ash_provider_cfg *cfg,
             ash_buf_append_byte(b, ',');
         wrote = 1;
         if (m->tool_name != NULL) {
-            ash_buf_append_cstr(b, "{\"role\":\"");
-            esc(b, m->role ? m->role : "assistant");
-            ash_buf_append_cstr(b, "\",\"content\":");
+            ash_buf_append_cstr(b, "{\"role\":");
+            ash_json_quote_cstr(b, m->role ? m->role : "assistant");
+            ash_buf_append_cstr(b, ",\"content\":");
             if (m->content != NULL && m->content[0] != 0) {
-                ash_buf_append_byte(b, '"');
-                esc(b, m->content);
-                ash_buf_append_byte(b, '"');
+                ash_json_quote_cstr(b, m->content);
             } else {
                 ash_buf_append_cstr(b, "null");
             }
@@ -347,18 +262,18 @@ static void build_body_openai(ash_buf *b, const ash_provider_cfg *cfg,
             ash_buf_append_cstr(b, "]}");
             i = j;
         } else if (m->tool_result != NULL) {
-            ash_buf_append_cstr(b, "{\"role\":\"tool\",\"tool_call_id\":\"");
-            esc(b, m->tool_id ? m->tool_id : "");
-            ash_buf_append_cstr(b, "\",\"content\":\"");
-            esc(b, m->tool_result);
-            ash_buf_append_cstr(b, "\"}");
+            ash_buf_append_cstr(b, "{\"role\":\"tool\",\"tool_call_id\":");
+            ash_json_quote_cstr(b, m->tool_id ? m->tool_id : "");
+            ash_buf_append_cstr(b, ",\"content\":");
+            ash_json_quote_cstr(b, m->tool_result);
+            ash_buf_append_byte(b, '}');
             i++;
         } else {
-            ash_buf_append_cstr(b, "{\"role\":\"");
-            esc(b, m->role ? m->role : "user");
-            ash_buf_append_cstr(b, "\",\"content\":\"");
-            esc(b, m->content ? m->content : "");
-            ash_buf_append_cstr(b, "\"}");
+            ash_buf_append_cstr(b, "{\"role\":");
+            ash_json_quote_cstr(b, m->role ? m->role : "user");
+            ash_buf_append_cstr(b, ",\"content\":");
+            ash_json_quote_cstr(b, m->content ? m->content : "");
+            ash_buf_append_byte(b, '}');
             i++;
         }
     }

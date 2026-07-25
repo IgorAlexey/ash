@@ -1,3 +1,4 @@
+#include <assert.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -399,4 +400,87 @@ ash_status ash_json_int64(const ash_json *v, int64_t *out)
     else
         *out = (int64_t)mag;
     return ASH_OK;
+}
+
+static size_t utf8_seq_len(const unsigned char *p, size_t n)
+{
+    if (n == 0)
+        return 0;
+    unsigned char c = p[0];
+    if (c < 0x80)
+        return 1;
+    size_t len;
+    unsigned char lo = 0x80, hi = 0xbf;
+    if (c >= 0xc2 && c <= 0xdf) {
+        len = 2;
+    } else if (c >= 0xe0 && c <= 0xef) {
+        len = 3;
+        if (c == 0xe0)
+            lo = 0xa0;
+        else if (c == 0xed)
+            hi = 0x9f;
+    } else if (c >= 0xf0 && c <= 0xf4) {
+        len = 4;
+        if (c == 0xf0)
+            lo = 0x90;
+        else if (c == 0xf4)
+            hi = 0x8f;
+    } else {
+        return 0;
+    }
+    if (n < len)
+        return 0;
+    if (p[1] < lo || p[1] > hi)
+        return 0;
+    for (size_t i = 2; i < len; i++)
+        if (p[i] < 0x80 || p[i] > 0xbf)
+            return 0;
+    return len;
+}
+
+static const char hexd[] = "0123456789abcdef";
+
+static void esc_bytes(ash_buf *b, const char *p, size_t n)
+{
+    for (size_t i = 0; i < n; i++) {
+        unsigned char c = (unsigned char)p[i];
+        switch (c) {
+        case '"':  ash_buf_append(b, "\\\"", 2); break;
+        case '\\': ash_buf_append(b, "\\\\", 2); break;
+        case '\n': ash_buf_append(b, "\\n", 2); break;
+        case '\r': ash_buf_append(b, "\\r", 2); break;
+        case '\t': ash_buf_append(b, "\\t", 2); break;
+        case '\b': ash_buf_append(b, "\\b", 2); break;
+        case '\f': ash_buf_append(b, "\\f", 2); break;
+        default:
+            if (c < 0x20) {
+                const char u[6] = { '\\', 'u', '0', '0',
+                                    hexd[c >> 4], hexd[c & 0xf] };
+                ash_buf_append(b, u, sizeof u);
+            } else if (c < 0x80) {
+                ash_buf_append_byte(b, c);
+            } else {
+                size_t len = utf8_seq_len((const unsigned char *)p + i, n - i);
+                if (len > 0) {
+                    ash_buf_append(b, p + i, len);
+                    i += len - 1;
+                } else {
+                    ash_buf_append(b, "\\ufffd", 6);
+                }
+            }
+        }
+    }
+}
+
+void ash_json_quote(ash_buf *b, const char *p, size_t n)
+{
+    ash_buf_append_byte(b, '"');
+    esc_bytes(b, p, n);
+    ash_buf_append_byte(b, '"');
+}
+
+void ash_json_quote_cstr(ash_buf *b, const char *s)
+{
+    assert(s != NULL);
+    ash_json_quote(b, s, strlen(s));
 }

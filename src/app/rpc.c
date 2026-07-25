@@ -67,31 +67,6 @@ static void write_bytes(struct ash_rpc *R, const void *p, size_t n)
     }
 }
 
-static void esc_bytes(ash_buf *b, const char *p, size_t n)
-{
-    for (size_t i = 0; i < n; i++) {
-        unsigned char c = (unsigned char)p[i];
-        switch (c) {
-        case '"':  ash_buf_append(b, "\\\"", 2); break;
-        case '\\': ash_buf_append(b, "\\\\", 2); break;
-        case '\n': ash_buf_append(b, "\\n", 2); break;
-        case '\r': ash_buf_append(b, "\\r", 2); break;
-        case '\t': ash_buf_append(b, "\\t", 2); break;
-        case '\b': ash_buf_append(b, "\\b", 2); break;
-        case '\f': ash_buf_append(b, "\\f", 2); break;
-        default:
-            if (c < 0x20) {
-                char u[8];
-                int k = snprintf(u, sizeof u, "\\u%04x", c);
-                if (k > 0)
-                    ash_buf_append(b, u, (size_t)k);
-            } else {
-                ash_buf_append_byte(b, c);
-            }
-        }
-    }
-}
-
 static void emit_compact(ash_buf *b, const ash_json *v)
 {
     switch (v->type) {
@@ -105,9 +80,7 @@ static void emit_compact(ash_buf *b, const ash_json *v)
         ash_buf_append(b, v->u.num.p, v->u.num.n);
         return;
     case ASH_JSON_STRING:
-        ash_buf_append_byte(b, '"');
-        esc_bytes(b, v->u.str.p, v->u.str.n);
-        ash_buf_append_byte(b, '"');
+        ash_json_quote(b, v->u.str.p, v->u.str.n);
         return;
     case ASH_JSON_ARRAY:
         ash_buf_append_byte(b, '[');
@@ -123,9 +96,8 @@ static void emit_compact(ash_buf *b, const ash_json *v)
         for (size_t i = 0; i < v->u.obj.n; i++) {
             if (i)
                 ash_buf_append_byte(b, ',');
-            ash_buf_append_byte(b, '"');
-            esc_bytes(b, v->u.obj.v[i].key, v->u.obj.v[i].klen);
-            ash_buf_append_cstr(b, "\":");
+            ash_json_quote(b, v->u.obj.v[i].key, v->u.obj.v[i].klen);
+            ash_buf_append_byte(b, ':');
             emit_compact(b, &v->u.obj.v[i].val);
         }
         ash_buf_append_byte(b, '}');
@@ -137,9 +109,8 @@ static void field_str(ash_buf *b, const char *key, const char *p, size_t n)
 {
     ash_buf_append_byte(b, '"');
     ash_buf_append_cstr(b, key);
-    ash_buf_append_cstr(b, "\":\"");
-    esc_bytes(b, p, n);
-    ash_buf_append_byte(b, '"');
+    ash_buf_append_cstr(b, "\":");
+    ash_json_quote(b, p, n);
 }
 
 static void append_input(struct ash_rpc *R, ash_buf *b,

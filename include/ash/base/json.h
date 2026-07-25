@@ -6,6 +6,7 @@
 
 #include "ash/base/api.h"
 #include "ash/base/arena.h"
+#include "ash/base/buf.h"
 #include "ash/base/slice.h"
 #include "ash/base/status.h"
 
@@ -55,5 +56,8 @@ ASH_API ASH_WUR ash_status ash_json_parse(ash_arena *a, const char *buf,
 ASH_API const ash_json *ash_json_get(const ash_json *v, const char *key);
 ASH_API ASH_WUR ash_status ash_json_str(const ash_json *v, ash_slice *out);
 ASH_API ASH_WUR ash_status ash_json_int64(const ash_json *v, int64_t *out);
+
+ASH_API void ash_json_quote(ash_buf *b, const char *p, size_t n);
+ASH_API void ash_json_quote_cstr(ash_buf *b, const char *s);
 
 #endif

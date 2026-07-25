@@ -11,6 +11,8 @@
 #include "ash/ai/http.h"
 #include "ash/app/rpc.h"
 #include "ash/base/arena.h"
+#include "ash/base/json.h"
+#include "ash/base/slice.h"
 #include "ash_test.h"
 
 static const char HAPPY[] =
@@ -44,6 +46,29 @@ static const char TOOL_USE[] =
     "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
     "{\"type\":\"input_json_delta\",\"partial_json\":"
     "\"{\\\"command\\\": \\\"echo TOOLTEST\\\"}\"}}\n"
+    "\n"
+    "event: content_block_stop\n"
+    "data: {\"type\":\"content_block_stop\",\"index\":0}\n"
+    "\n"
+    "event: message_delta\n"
+    "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"}}\n"
+    "\n"
+    "event: message_stop\n"
+    "data: {\"type\":\"message_stop\"}\n"
+    "\n";
+
+static const char TOOL_USE_BINARY[] =
+    "event: message_start\n"
+    "data: {\"type\":\"message_start\",\"message\":{\"role\":\"assistant\"}}\n"
+    "\n"
+    "event: content_block_start\n"
+    "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":"
+    "{\"type\":\"tool_use\",\"id\":\"toolu_b\",\"name\":\"bash\",\"input\":{}}}\n"
+    "\n"
+    "event: content_block_delta\n"
+    "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":"
+    "{\"type\":\"input_json_delta\",\"partial_json\":"
+    "\"{\\\"command\\\": \\\"printf '\\\\\\\\377\\\\\\\\376'\\\"}\"}}\n"
     "\n"
     "event: content_block_stop\n"
     "data: {\"type\":\"content_block_stop\",\"index\":0}\n"
@@ -275,6 +300,81 @@ static void test_prompt_tool(void)
     (void)waitpid(pid, NULL, 0);
 }
 
+static void check_tool_end_line(ash_arena *a, const char *line, size_t n,
+                                int *seen)
+{
+    ash_json v;
+    ash_status st = ash_json_parse(a, line, n, &v);
+    ASH_CHECK(st == ASH_OK);
+    if (st != ASH_OK)
+        return;
+    ASH_CHECK(v.type == ASH_JSON_OBJECT);
+
+    const ash_json *ev = ash_json_get(&v, "event");
+    ash_slice es;
+    if (ev == NULL || ash_json_str(ev, &es) != ASH_OK)
+        return;
+    if (es.len != sizeof "tool_execution_end" - 1 ||
+        memcmp(es.p, "tool_execution_end", es.len) != 0)
+        return;
+
+    (*seen)++;
+    const ash_json *res = ash_json_get(&v, "result");
+    ASH_CHECK(res != NULL);
+    if (res == NULL)
+        return;
+    ash_slice rs;
+    ash_status rst = ash_json_str(res, &rs);
+    ASH_CHECK(rst == ASH_OK);
+    if (rst != ASH_OK)
+        return;
+    static const unsigned char want[] = { 0xef, 0xbf, 0xbd, 0xef, 0xbf, 0xbd };
+    ASH_CHECK(rs.len == sizeof want && memcmp(rs.p, want, sizeof want) == 0);
+}
+
+static void test_prompt_tool_binary(void)
+{
+    int port = 0;
+    int lfd = listen_loopback(&port);
+    ASH_CHECK(lfd >= 0);
+    pid_t pid = fork();
+    ASH_CHECK(pid >= 0);
+    if (pid == 0) {
+        serve_body(lfd, TOOL_USE_BINARY);
+        serve_body(lfd, TOOL_FINAL);
+        close(lfd);
+        _exit(0);
+    }
+    close(lfd);
+
+    int inp[2] = { -1, -1 };
+    ASH_CHECK(pipe(inp) == 0);
+    const char *cmd = "{\"type\":\"prompt\",\"message\":\"dump bytes\"}\n";
+    write_all(inp[1], cmd, strlen(cmd));
+    close(inp[1]);
+
+    char url[64], out[8192];
+    (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+    run_rpc(url, inp[0], out, sizeof out);
+    close(inp[0]);
+    (void)waitpid(pid, NULL, 0);
+
+    ash_arena a;
+    ASH_CHECK(ash_arena_create(&a, "toolbin", 1u << 18) == ASH_OK);
+
+    int seen = 0;
+    const char *p = out;
+    while (*p != 0) {
+        const char *nl = strchr(p, '\n');
+        size_t n = nl != NULL ? (size_t)(nl - p) : strlen(p);
+        if (n > 0)
+            check_tool_end_line(&a, p, n, &seen);
+        p = nl != NULL ? nl + 1 : p + n;
+    }
+    ASH_CHECK(seen == 1);
+    ash_arena_destroy(&a);
+}
+
 int main(void)
 {
     ASH_CHECK(ash_http_global_init() == ASH_OK);
@@ -282,6 +382,7 @@ int main(void)
     test_sync();
     test_prompt();
     test_prompt_tool();
+    test_prompt_tool_binary();
     ash_http_global_cleanup();
     return ash_test_done();
 }
