@@ -111,15 +111,28 @@ static void report_status(const char *call, ash_status st)
     fprintf(stderr, "  %s failed: %s (%d)\n", call, ash_status_str(st), (int)st);
 }
 
-static void write_all(int c, const char *p, size_t n)
+static ash_status write_all(int c, const char *p, size_t n)
 {
     size_t off = 0;
+    ssize_t w = 0;
+    int err = 0;
     while (off < n) {
-        ssize_t w = write(c, p + off, n - off);
-        if (w <= 0)
+        w = write(c, p + off, n - off);
+        if (w <= 0) {
+            err = errno;
             break;
+        }
         off += (size_t)w;
     }
+    ASH_CHECK(off == n);
+    if (off == n)
+        return ASH_OK;
+    if (w == 0) {
+        fprintf(stderr, "  write wrote 0 of %zu remaining bytes\n", n - off);
+        return ASH_ERR_IO;
+    }
+    report_errno("write", err);
+    return ASH_ERR_OS;
 }
 
 static int listen_loopback(int *port, const char **call, int *err)
@@ -178,8 +191,17 @@ static void serve_body(int lfd, const char *body)
         close(c);
         return;
     }
-    write_all(c, hdr, (size_t)hn);
-    write_all(c, body, strlen(body));
+    ash_status wst = write_all(c, hdr, (size_t)hn);
+    ASH_CHECK(wst == ASH_OK);
+    if (wst != ASH_OK) {
+        report_status("write_all", wst);
+        close(c);
+        return;
+    }
+    wst = write_all(c, body, strlen(body));
+    ASH_CHECK(wst == ASH_OK);
+    if (wst != ASH_OK)
+        report_status("write_all", wst);
     close(c);
 }
 
@@ -346,8 +368,14 @@ static void test_sync(void)
         "{\"id\":\"4\",\"type\":\"bogus\"}\n"
         "garbage line\n"
         "\n";
-    write_all(inp[1], cmds, strlen(cmds));
+    ash_status wst = write_all(inp[1], cmds, strlen(cmds));
     close(inp[1]);
+    ASH_CHECK(wst == ASH_OK);
+    if (wst != ASH_OK) {
+        report_status("write_all", wst);
+        close(inp[0]);
+        return;
+    }
 
     char out[8192];
     ash_status st = run_rpc("http://127.0.0.1:1/", inp[0], out, sizeof out);
@@ -391,8 +419,15 @@ static void test_prompt(void)
     int inp[2] = { -1, -1 };
     PIPE_OR_BAIL(inp, kill_child(pid));
     const char *cmd = "{\"id\":\"p1\",\"type\":\"prompt\",\"message\":\"hi\"}\n";
-    write_all(inp[1], cmd, strlen(cmd));
+    ash_status wst = write_all(inp[1], cmd, strlen(cmd));
     close(inp[1]);
+    ASH_CHECK(wst == ASH_OK);
+    if (wst != ASH_OK) {
+        report_status("write_all", wst);
+        close(inp[0]);
+        kill_child(pid);
+        return;
+    }
 
     char url[64], out[8192];
     (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
@@ -439,8 +474,15 @@ static void test_prompt_tool(void)
     int inp[2] = { -1, -1 };
     PIPE_OR_BAIL(inp, kill_child(pid));
     const char *cmd = "{\"type\":\"prompt\",\"message\":\"run it\"}\n";
-    write_all(inp[1], cmd, strlen(cmd));
+    ash_status wst = write_all(inp[1], cmd, strlen(cmd));
     close(inp[1]);
+    ASH_CHECK(wst == ASH_OK);
+    if (wst != ASH_OK) {
+        report_status("write_all", wst);
+        close(inp[0]);
+        kill_child(pid);
+        return;
+    }
 
     char url[64], out[8192];
     (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
@@ -519,8 +561,15 @@ static void test_prompt_tool_binary(void)
     int inp[2] = { -1, -1 };
     PIPE_OR_BAIL(inp, kill_child(pid));
     const char *cmd = "{\"type\":\"prompt\",\"message\":\"dump bytes\"}\n";
-    write_all(inp[1], cmd, strlen(cmd));
+    ash_status wst = write_all(inp[1], cmd, strlen(cmd));
     close(inp[1]);
+    ASH_CHECK(wst == ASH_OK);
+    if (wst != ASH_OK) {
+        report_status("write_all", wst);
+        close(inp[0]);
+        kill_child(pid);
+        return;
+    }
 
     char url[64], out[8192];
     (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
