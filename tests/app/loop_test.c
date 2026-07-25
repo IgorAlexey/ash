@@ -339,7 +339,7 @@ static void wait_check(pid_t pid, const char *role, int server,
                        "%s was still running after %d seconds, killed", role,
                        CHILD_WAIT_MS / 1000);
     } else if (r < 0) {
-        (void)snprintf(msg, sizeof msg, "%s: waitpid failed: %s", role,
+        (void)snprintf(msg, sizeof msg, "%s waitpid failed: %s", role,
                        strerror(err));
     } else if (WIFSIGNALED(st)) {
         (void)snprintf(msg, sizeof msg, "%s died on signal %d", role,
