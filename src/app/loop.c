@@ -41,6 +41,7 @@
 #include "ash/base/poison.h"
 
 enum { LOOP_STACK = 1u << 18 };
+enum { FEED_EVENTS = 32 };
 
 enum { SB_CELL_BUDGET = 8u << 20 };
 enum { SB_MAX_LINES = 8192 };
@@ -91,7 +92,12 @@ struct ash_loop {
     ash_input        dfa;
     ash_textarea     ta;
     uint8_t          inbuf[4096];
+    size_t           inpos;
     size_t           inlen;
+    ash_input_event  evs[FEED_EVENTS];
+    uint32_t         nevs;
+    uint32_t         evcur;
+    int              stalled;
     int              in_eof;
 
     ash_provider_stream *stream;
@@ -521,12 +527,24 @@ static void do_cut(struct ash_loop *L)
         ui_block_str(L, ASH_TS_INFO, "[selection truncated to 1 MiB]\n");
 }
 
+static int in_pending(const struct ash_loop *L)
+{
+    return L->evcur < L->nevs || L->inpos < L->inlen;
+}
+
 static void read_input(struct ash_loop *L)
 {
+    if (in_pending(L))
+        return;
+
     ssize_t n;
     do {
         n = read(L->in_fd, L->inbuf, sizeof L->inbuf);
     } while (n < 0 && errno == EINTR);
+    L->inpos = 0;
+    L->nevs = 0;
+    L->evcur = 0;
+    L->stalled = 0;
     if (n <= 0) {
         L->inlen = 0;
         if (n == 0)
@@ -536,12 +554,44 @@ static void read_input(struct ash_loop *L)
     L->inlen = (size_t)n;
 }
 
-static int inbuf_has_cancel(const struct ash_loop *L)
+static const ash_input_event *in_next(struct ash_loop *L)
 {
-    for (size_t i = 0; i < L->inlen; i++)
-        if (L->inbuf[i] == 0x03)
-            return 1;
-    return 0;
+    for (;;) {
+        if (L->evcur < L->nevs)
+            return &L->evs[L->evcur++];
+        if (L->inpos >= L->inlen)
+            return NULL;
+
+        uint32_t consumed = 0, produced = 0;
+        if (ash_input_feed(&L->dfa, L->inbuf + L->inpos,
+                           (uint32_t)(L->inlen - L->inpos), L->evs, FEED_EVENTS,
+                           &consumed, &produced) != ASH_OK) {
+            L->nevs = 0;
+            L->evcur = 0;
+            L->inpos = L->inlen;
+            L->stalled = 0;
+            return NULL;
+        }
+        L->nevs = produced;
+        L->evcur = 0;
+        if (consumed == 0 && (produced == 0 || L->stalled)) {
+            L->inpos = L->inlen;
+            L->stalled = 0;
+            continue;
+        }
+        L->stalled = consumed == 0;
+        L->inpos += consumed;
+    }
+}
+
+static int in_drain_saw_cancel(struct ash_loop *L)
+{
+    int cancel = 0;
+    const ash_input_event *ev;
+    while ((ev = in_next(L)) != NULL)
+        if (ash_key_map(ev).cmd == ASH_EC_CANCEL)
+            cancel = 1;
+    return cancel;
 }
 
 static void queue_submit(struct ash_loop *L)
@@ -567,133 +617,113 @@ typedef enum {
 static ash_in_result input_dispatch(struct ash_loop *L, ash_in_mode mode)
 {
     ash_in_result res = ASH_IN_NONE;
-    uint32_t off = 0;
-    while (off < L->inlen) {
-        ash_input_event evs[32];
-        uint32_t consumed = 0, produced = 0;
-        if (ash_input_feed(&L->dfa, L->inbuf + off, (uint32_t)(L->inlen - off),
-                           evs, 32, &consumed, &produced) != ASH_OK)
-            break;
-        if (consumed == 0)
-            break;
-        off += consumed;
+    const ash_input_event *ev;
+    while ((ev = in_next(L)) != NULL) {
+        if (ev->kind == ASH_EV_MOUSE) {
+            handle_mouse(L, ev);
+            continue;
+        }
+        if (handle_page_key(L, ev))
+            continue;
+        if (ev->kind == ASH_EV_KEY && ev->key == 27 && L->sel.active) {
+            ash_sel_clear(&L->sel);
+            continue;
+        }
+        if (L->tui && ev->kind == ASH_EV_KEY && ev->key == 'o' &&
+            (ev->mods & ASH_MOD_CTRL)) {
+            L->tools_expanded = !L->tools_expanded;
+            reproject_full(L, ui_width(L));
+            continue;
+        }
 
-        for (uint32_t i = 0; i < produced; i++) {
-            const ash_input_event *ev = &evs[i];
-            if (ev->kind == ASH_EV_MOUSE) {
-                handle_mouse(L, ev);
+        ash_key k = ash_key_map(ev);
+        if (k.cmd == ASH_EC_COPY) {
+            do_copy(L);
+            continue;
+        }
+        if (k.cmd == ASH_EC_CUT) {
+            do_cut(L);
+            continue;
+        }
+        if (k.cmd == ASH_EC_PASTE)
+            continue;
+        if (k.cmd == ASH_EC_SUBMIT) {
+            if (mode == ASH_IN_BUSY) {
+                queue_submit(L);
                 continue;
             }
-            if (handle_page_key(L, ev))
+            ash_buf_init(&L->line, &L->mem.turn);
+            ash_textarea_text(&L->ta, &L->line);
+            if (L->tui)
+                ash_textarea_clear(&L->ta);
+            else
+                L->ta_live = 0;
+            if (mode == ASH_IN_LOGIN) {
+                write_str(L, "\n");
+            } else {
+                const char *bc;
+                size_t bl;
+                if (!ash_bang_split((const char *)L->line.data, L->line.len,
+                                    &bc, &bl))
+                    ui_user(L, (const char *)L->line.data, L->line.len);
+            }
+            return ASH_IN_SUBMIT;
+        }
+        if (k.cmd == ASH_EC_EOF) {
+            if (mode == ASH_IN_BUSY || ash_textarea_len(&L->ta) != 0)
                 continue;
-            if (ev->kind == ASH_EV_KEY && ev->key == 27 && L->sel.active) {
+            return ASH_IN_EOF;
+        }
+        if (k.cmd == ASH_EC_CANCEL) {
+            if (mode == ASH_IN_LOGIN)
+                return ASH_IN_CANCEL;
+            if (!ash_sel_empty(&L->sel)) {
+                do_copy(L);
                 ash_sel_clear(&L->sel);
                 continue;
             }
-            if (L->tui && ev->kind == ASH_EV_KEY && ev->key == 'o' &&
-                (ev->mods & ASH_MOD_CTRL)) {
-                L->tools_expanded = !L->tools_expanded;
-                reproject_full(L, ui_width(L));
+            if (mode == ASH_IN_BUSY) {
+                res = ASH_IN_CANCEL;
                 continue;
             }
-
-            ash_key k = ash_key_map(ev);
-            if (k.cmd == ASH_EC_COPY) {
-                do_copy(L);
-                continue;
+            if (ash_textarea_len(&L->ta) == 0)
+                return ASH_IN_EOF;
+            ash_textarea_clear(&L->ta);
+            if (!L->tui) {
+                write_str(L, "\n");
+                write_str(L, "> ");
             }
-            if (k.cmd == ASH_EC_CUT) {
-                do_cut(L);
-                continue;
-            }
-            if (k.cmd == ASH_EC_PASTE)
-                continue;
-            if (k.cmd == ASH_EC_SUBMIT) {
-                if (mode == ASH_IN_BUSY) {
-                    queue_submit(L);
-                    continue;
-                }
-                ash_buf_init(&L->line, &L->mem.turn);
-                ash_textarea_text(&L->ta, &L->line);
-                if (L->tui)
-                    ash_textarea_clear(&L->ta);
-                else
-                    L->ta_live = 0;
-                if (mode == ASH_IN_LOGIN) {
-                    write_str(L, "\n");
-                } else {
-                    const char *bc;
-                    size_t bl;
-                    if (!ash_bang_split((const char *)L->line.data, L->line.len,
-                                        &bc, &bl))
-                        ui_user(L, (const char *)L->line.data, L->line.len);
-                }
-                res = ASH_IN_SUBMIT;
-                goto done;
-            }
-            if (k.cmd == ASH_EC_EOF) {
-                if (mode == ASH_IN_BUSY || ash_textarea_len(&L->ta) != 0)
-                    continue;
-                res = ASH_IN_EOF;
-                goto done;
-            }
-            if (k.cmd == ASH_EC_CANCEL) {
-                if (mode == ASH_IN_LOGIN) {
-                    res = ASH_IN_CANCEL;
-                    goto done;
-                }
-                if (!ash_sel_empty(&L->sel)) {
-                    do_copy(L);
-                    ash_sel_clear(&L->sel);
-                    continue;
-                }
-                if (mode == ASH_IN_BUSY) {
-                    res = ASH_IN_CANCEL;
-                    continue;
-                }
-                if (ash_textarea_len(&L->ta) == 0) {
-                    res = ASH_IN_EOF;
-                    goto done;
-                }
-                ash_textarea_clear(&L->ta);
-                if (!L->tui) {
-                    write_str(L, "\n");
-                    write_str(L, "> ");
-                }
-                continue;
-            }
-            if (k.cmd == ASH_EC_INSERT || k.cmd == ASH_EC_PASTE_CHUNK) {
-                ash_textarea_insert(&L->ta, k.text, k.len);
-                if (!L->tui)
-                    write_bytes(L, k.text, k.len);
-                continue;
-            }
-            if (k.cmd == ASH_EC_NEWLINE) {
-                ash_textarea_insert(&L->ta, "\n", 1);
-                if (!L->tui)
-                    write_str(L, "\n");
-                continue;
-            }
-            if (k.cmd == ASH_EC_BACKSPACE) {
-                int at_end = ash_textarea_at_end(&L->ta);
-                int w = ash_textarea_backspace(&L->ta);
-                if (!L->tui)
-                    for (int j = 0; at_end && j < w; j++)
-                        write_str(L, "\b \b");
-                continue;
-            }
-            ash_textarea_apply(&L->ta, k);
+            continue;
         }
+        if (k.cmd == ASH_EC_INSERT || k.cmd == ASH_EC_PASTE_CHUNK) {
+            ash_textarea_insert(&L->ta, k.text, k.len);
+            if (!L->tui)
+                write_bytes(L, k.text, k.len);
+            continue;
+        }
+        if (k.cmd == ASH_EC_NEWLINE) {
+            ash_textarea_insert(&L->ta, "\n", 1);
+            if (!L->tui)
+                write_str(L, "\n");
+            continue;
+        }
+        if (k.cmd == ASH_EC_BACKSPACE) {
+            int at_end = ash_textarea_at_end(&L->ta);
+            int w = ash_textarea_backspace(&L->ta);
+            if (!L->tui)
+                for (int j = 0; at_end && j < w; j++)
+                    write_str(L, "\b \b");
+            continue;
+        }
+        ash_textarea_apply(&L->ta, k);
     }
-done:
-    L->inlen = 0;
     return res;
 }
 
 static int busy_input(struct ash_loop *L)
 {
     if (!L->tui)
-        return inbuf_has_cancel(L);
+        return in_drain_saw_cancel(L);
     return input_dispatch(L, ASH_IN_BUSY) == ASH_IN_CANCEL;
 }
 
@@ -749,8 +779,9 @@ static int read_line(ash_co *co, struct ash_loop *L)
         ash_textarea_init(&L->ta, &L->mem.turn, L->wrap_w > 0 ? L->wrap_w : 80, 0);
     L->ta_live = 1;
     for (;;) {
-        ash_co_yield(co, ASH_WAIT_INPUT);
-        if (L->inlen == 0)
+        if (!in_pending(L))
+            ash_co_yield(co, ASH_WAIT_INPUT);
+        if (!in_pending(L))
             break;
         ash_in_result r = input_dispatch(L, ASH_IN_PROMPT);
         if (r == ASH_IN_SUBMIT)
@@ -817,7 +848,7 @@ static int loop_pump(void *ud, ash_provider_stream *s)
     L->running = 1;
     while (L->running) {
         ash_co_yield(&L->co, ASH_WAIT_SSE);
-        if (L->inlen > 0 && busy_input(L)) {
+        if (in_pending(L) && busy_input(L)) {
             canceled = 1;
             break;
         }
@@ -847,7 +878,7 @@ static int loop_shell(void *ud, const char *cmd, ash_buf *out)
     L->tool_truncated = 0;
     while (!L->tool_done) {
         ash_co_yield(&L->co, ASH_WAIT_TOOL);
-        if (L->inlen > 0 && busy_input(L)) {
+        if (in_pending(L) && busy_input(L)) {
             canceled = 1;
             break;
         }
@@ -936,41 +967,15 @@ static void frame_emit(struct ash_loop *L)
     ash_screen_frame_end();
 }
 
-typedef struct modal_pump {
-    ash_input_event evs[32];
-    uint32_t        produced;
-    uint32_t        cursor;
-    size_t          off;
-} modal_pump;
-
-static void modal_pump_init(modal_pump *p)
-{
-    p->produced = 0;
-    p->cursor = 0;
-    p->off = 0;
-}
-
-static const ash_input_event *modal_pump_next(struct ash_loop *L, modal_pump *p)
+static const ash_input_event *modal_pump_next(struct ash_loop *L)
 {
     for (;;) {
-        if (p->cursor < p->produced)
-            return &p->evs[p->cursor++];
-        if (p->off >= L->inlen) {
-            L->inlen = 0;
-            ash_co_yield(&L->co, ASH_WAIT_INPUT);
-            if (L->inlen == 0)
-                return NULL;
-            p->off = 0;
-        }
-        uint32_t consumed = 0;
-        p->produced = 0;
-        p->cursor = 0;
-        if (ash_input_feed(&L->dfa, L->inbuf + p->off,
-                           (uint32_t)(L->inlen - p->off), p->evs, 32, &consumed,
-                           &p->produced) != ASH_OK || consumed == 0)
-            p->off = L->inlen;
-        else
-            p->off += consumed;
+        const ash_input_event *ev = in_next(L);
+        if (ev != NULL)
+            return ev;
+        ash_co_yield(&L->co, ASH_WAIT_INPUT);
+        if (!in_pending(L))
+            return NULL;
     }
 }
 
@@ -1002,10 +1007,8 @@ static void run_modal(struct ash_loop *L, ash_tui *t, ash_modal_fn draw,
     L->modal_open = 1;
     modal_frame(L, t, draw, ud, NULL);
 
-    modal_pump p;
-    modal_pump_init(&p);
     while (!*closed) {
-        const ash_input_event *ev = modal_pump_next(L, &p);
+        const ash_input_event *ev = modal_pump_next(L);
         if (ev == NULL)
             break;
         modal_frame(L, t, draw, ud, ev);
@@ -1114,8 +1117,6 @@ static ash_diffview_action run_diffview(struct ash_loop *L, ash_diffview *dv)
 {
     ash_diffview_theme th = confirm_theme(L->theme);
     ash_arena_mark mk = ash_arena_mark_get(&L->modal_arena);
-    modal_pump p;
-    modal_pump_init(&p);
     for (;;) {
         int w, h;
         term_size(L, &w, &h);
@@ -1124,7 +1125,7 @@ static ash_diffview_action run_diffview(struct ash_loop *L, ash_diffview *dv)
         ash_diffview_render(dv, &L->fb, (ash_rect){ 0, 0, w, h }, &th);
         frame_emit(L);
 
-        const ash_input_event *ev = modal_pump_next(L, &p);
+        const ash_input_event *ev = modal_pump_next(L);
         if (ev == NULL)
             return ASH_DIFFVIEW_REJECT;
         if (ev->kind != ASH_EV_KEY)
@@ -1137,8 +1138,6 @@ static ash_diffview_action run_diffview(struct ash_loop *L, ash_diffview *dv)
 
 static int run_editor(struct ash_loop *L, ash_editor *ed)
 {
-    modal_pump p;
-    modal_pump_init(&p);
     for (;;) {
         int w, h;
         term_size(L, &w, &h);
@@ -1147,7 +1146,7 @@ static int run_editor(struct ash_loop *L, ash_editor *ed)
                           ash_selection_style());
         frame_emit(L);
 
-        const ash_input_event *ev = modal_pump_next(L, &p);
+        const ash_input_event *ev = modal_pump_next(L);
         if (ev == NULL)
             return 0;
         if (ev->kind != ASH_EV_KEY)
@@ -1214,8 +1213,9 @@ static int login_read(ash_co *co, struct ash_loop *L)
         ash_textarea_init(&L->ta, &L->mem.turn, L->wrap_w > 0 ? L->wrap_w : 80, 0);
     L->ta_live = 1;
     for (;;) {
-        ash_co_yield(co, ASH_WAIT_INPUT);
-        if (L->inlen == 0)
+        if (!in_pending(L))
+            ash_co_yield(co, ASH_WAIT_INPUT);
+        if (!in_pending(L))
             break;
         ash_in_result r = input_dispatch(L, ASH_IN_LOGIN);
         if (r == ASH_IN_SUBMIT)
@@ -1472,7 +1472,6 @@ static ash_status loop_run(struct ash_loop *L)
                 st = ash_provider_pump(L->stream, &L->running);
             if (st != ASH_OK)
                 L->running = 0;
-            L->inlen = 0;
             if (ready)
                 read_input(L);
         } else if (w == ASH_WAIT_TOOL) {
@@ -1497,7 +1496,6 @@ static ash_status loop_run(struct ash_loop *L)
             do {
                 r = poll(pfds, nfd, L->child_exited ? 200 : -1);
             } while (r < 0 && errno == EINTR);
-            L->inlen = 0;
             if (slot_pid >= 0 && (pfds[slot_pid].revents & POLLIN))
                 L->child_exited = 1;
             if (pfds[slot_out].revents & (POLLIN | POLLHUP)) {

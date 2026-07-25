@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -234,6 +236,44 @@ static void wait_until_raw(int mfd)
     ASH_CHECK(pty_is_raw(mfd));
 }
 
+static int64_t now_ms(void)
+{
+    struct timespec ts;
+    (void)clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+enum { PTY_WAIT_MS = 20000, PTY_POLL_MS = 50 };
+
+static int pty_read_until(int mfd, char *out, size_t cap, size_t *got,
+                          const char *want)
+{
+    int64_t deadline = now_ms() + PTY_WAIT_MS;
+    for (;;) {
+        if (want != NULL && strstr(out, want) != NULL)
+            return 1;
+        int64_t left = deadline - now_ms();
+        if (left <= 0)
+            return 0;
+        struct pollfd pfd = { .fd = mfd, .events = POLLIN, .revents = 0 };
+        int r = poll(&pfd, 1, left < PTY_POLL_MS ? (int)left : PTY_POLL_MS);
+        if (r < 0) {
+            if (errno == EINTR)
+                continue;
+            return 0;
+        }
+        if (r == 0)
+            continue;
+        if (*got >= cap - 1)
+            return 0;
+        ssize_t n = read(mfd, out + *got, cap - 1 - *got);
+        if (n <= 0)
+            return want == NULL;
+        *got += (size_t)n;
+        out[*got] = 0;
+    }
+}
+
 static void write_all(int c, const char *p, size_t n)
 {
     size_t off = 0;
@@ -243,6 +283,11 @@ static void write_all(int c, const char *p, size_t n)
             break;
         off += (size_t)w;
     }
+}
+
+static void write_str_all(int c, const char *s)
+{
+    write_all(c, s, strlen(s));
 }
 
 static int listen_loopback(int *port)
@@ -473,6 +518,141 @@ static void test_cancel(void)
     (void)waitpid(spid, NULL, 0);
 }
 
+static void test_cancel_same_read(void)
+{
+    int port;
+    int lfd = listen_loopback(&port);
+    ASH_CHECK(lfd >= 0);
+    pid_t spid = fork();
+    ASH_CHECK(spid >= 0);
+    if (spid == 0) {
+        serve_body_delay(lfd, HAPPY, 400);
+        close(lfd);
+        _exit(0);
+    }
+    close(lfd);
+
+    int inp[2];
+    ASH_CHECK(pipe(inp) == 0);
+    write_str_all(inp[1], "hello\r\x03");
+    close(inp[1]);
+
+    char url[64], out[8192];
+    (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+    run_loop(url, inp[0], out, sizeof out);
+    close(inp[0]);
+
+    ASH_CHECK(strstr(out, "[canceled]") != NULL);
+    (void)waitpid(spid, NULL, 0);
+}
+
+static void paste_cancel_case(const char *seq, size_t n)
+{
+    int port;
+    int lfd = listen_loopback(&port);
+    ASH_CHECK(lfd >= 0);
+    pid_t spid = fork();
+    ASH_CHECK(spid >= 0);
+    if (spid == 0) {
+        serve_body_delay(lfd, HAPPY, 400);
+        close(lfd);
+        _exit(0);
+    }
+    close(lfd);
+
+    int inp[2];
+    ASH_CHECK(pipe(inp) == 0);
+    write_all(inp[1], seq, n);
+    close(inp[1]);
+
+    char url[64];
+    static char out[8192];
+    (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+    run_loop(url, inp[0], out, sizeof out);
+    close(inp[0]);
+
+    ASH_CHECK(strstr(out, "[canceled]") == NULL);
+    ASH_CHECK(strstr(out, "Hello, world") != NULL);
+    (void)waitpid(spid, NULL, 0);
+}
+
+static void test_paste_cancel_parsed(void)
+{
+    static const char SEQ[] = "hello\r\x1b[200~\x03\x1b[201~";
+    paste_cancel_case(SEQ, sizeof SEQ - 1);
+}
+
+static void test_paste_cancel_unfed(void)
+{
+    enum { READ_SPLIT = 4096 };
+    static const char TAIL[] = "\x03\x1b[201~";
+    static char seq[READ_SPLIT + sizeof TAIL];
+
+    size_t n = 0;
+    memcpy(seq + n, "hello\r\x1b[200~", 12);
+    n += 12;
+    memset(seq + n, 'a', (size_t)READ_SPLIT - n);
+    n = READ_SPLIT;
+    memcpy(seq + n, TAIL, sizeof TAIL - 1);
+    n += sizeof TAIL - 1;
+
+    paste_cancel_case(seq, n);
+}
+
+static void headless_typeahead_case(const char *seq, size_t n)
+{
+    int port;
+    int lfd = listen_loopback(&port);
+    ASH_CHECK(lfd >= 0);
+    pid_t spid = fork();
+    ASH_CHECK(spid >= 0);
+    if (spid == 0) {
+        serve_body_delay(lfd, HAPPY, 400);
+        close(lfd);
+        _exit(0);
+    }
+    close(lfd);
+
+    int inp[2];
+    ASH_CHECK(pipe(inp) == 0);
+    write_all(inp[1], seq, n);
+    close(inp[1]);
+
+    char url[64];
+    static char out[8192];
+    (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+    run_loop(url, inp[0], out, sizeof out);
+    close(inp[0]);
+
+    ASH_CHECK(strstr(out, "Hello, world") != NULL);
+    ASH_CHECK(strstr(out, "LATER") == NULL);
+    ASH_CHECK(strstr(out, "bye") != NULL);
+    (void)waitpid(spid, NULL, 0);
+}
+
+static void test_headless_typeahead_discarded(void)
+{
+    static const char SEQ[] = "hello\r!echo LAT''ER\r";
+    headless_typeahead_case(SEQ, sizeof SEQ - 1);
+}
+
+static void test_headless_midturn_discarded(void)
+{
+    enum { READ_SPLIT = 4096 };
+    static const char TAIL[] = "!echo LAT''ER\r";
+    static char seq[READ_SPLIT + sizeof TAIL];
+
+    size_t n = 0;
+    memcpy(seq + n, "hello\r", 6);
+    n += 6;
+    memset(seq + n, 'a', (size_t)READ_SPLIT - n);
+    n = READ_SPLIT;
+    memcpy(seq + n, TAIL, sizeof TAIL - 1);
+    n += sizeof TAIL - 1;
+
+    headless_typeahead_case(seq, n);
+}
+
 static void test_queue_while_busy(void)
 {
     int port;
@@ -553,6 +733,142 @@ static void test_queue_while_busy(void)
     (void)waitpid(wpid, NULL, 0);
     (void)waitpid(lpid, NULL, 0);
     (void)waitpid(spid, NULL, 0);
+}
+
+static pid_t spawn_loop_pty(const char *url, int *master)
+{
+    int mfd = posix_openpt(O_RDWR | O_NOCTTY);
+    ASH_CHECK(mfd >= 0);
+    ASH_CHECK(grantpt(mfd) == 0);
+    ASH_CHECK(unlockpt(mfd) == 0);
+    const char *sname = ptsname(mfd);
+    ASH_CHECK(sname != NULL);
+    int sfd = open(sname, O_RDWR | O_NOCTTY);
+    ASH_CHECK(sfd >= 0);
+
+    pid_t pid = fork();
+    ASH_CHECK(pid >= 0);
+    if (pid == 0) {
+        close(mfd);
+        ash_loop_cfg cfg = {
+            .url = url, .api_key = "k", .model = "claude-x", .max_tokens = 64,
+        };
+        if (ash_screen_init(sfd) == ASH_OK) {
+            ash_status st = ash_loop_run(&cfg, sfd, sfd);
+            (void)st;
+            ash_screen_shutdown();
+        }
+        close(sfd);
+        _exit(0);
+    }
+    close(sfd);
+    wait_until_raw(mfd);
+    *master = mfd;
+    return pid;
+}
+
+static void test_two_lines_one_write(void)
+{
+    int mfd = -1;
+    pid_t lpid = spawn_loop_pty("http://127.0.0.1:1/", &mfd);
+
+    write_str_all(mfd, "!echo AA''A\r!echo BB''B\r");
+
+    static char out[1 << 18];
+    size_t got = 0;
+    out[0] = 0;
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, "AAA"));
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, "BBB"));
+
+    const char *first = strstr(out, "AAA");
+    const char *second = strstr(out, "BBB");
+    ASH_CHECK(first != NULL);
+    ASH_CHECK(second != NULL);
+    ASH_CHECK(first < second);
+
+    write_str_all(mfd, "/quit\r");
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
+    close(mfd);
+
+    (void)waitpid(lpid, NULL, 0);
+}
+
+static void test_submit_then_eof_one_write(void)
+{
+    static const char SEQ[] = "!echo ON''EX\r\x04";
+
+    int mfd = -1;
+    pid_t lpid = spawn_loop_pty("http://127.0.0.1:1/", &mfd);
+
+    write_str_all(mfd, SEQ);
+
+    static char out[1 << 18];
+    size_t got = 0;
+    out[0] = 0;
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, "ONEX"));
+
+    write_str_all(mfd, "/quit\r");
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
+    close(mfd);
+
+    (void)waitpid(lpid, NULL, 0);
+}
+
+static void test_two_submits_one_write(void)
+{
+    static const char SEQ[] = "!echo ON''EX\r\r!echo TW''OX\r";
+
+    int mfd = -1;
+    pid_t lpid = spawn_loop_pty("http://127.0.0.1:1/", &mfd);
+
+    write_str_all(mfd, SEQ);
+
+    static char out[1 << 18];
+    size_t got = 0;
+    out[0] = 0;
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, "ONEX"));
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, "TWOX"));
+
+    const char *first = strstr(out, "ONEX");
+    const char *second = strstr(out, "TWOX");
+    ASH_CHECK(first != NULL);
+    ASH_CHECK(second != NULL);
+    ASH_CHECK(first < second);
+
+    write_str_all(mfd, "/quit\r");
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
+    close(mfd);
+
+    (void)waitpid(lpid, NULL, 0);
+}
+
+static void test_paste_mark_split(void)
+{
+    enum { READ_SPLIT = 4096 };
+    static const char TAIL[] = "X\x1b[201~\x03!echo PA''STE\r";
+    static char seq[READ_SPLIT + sizeof TAIL];
+
+    size_t n = 0;
+    memcpy(seq + n, "\x1b[200~", 6);
+    n += 6;
+    memset(seq + n, 'a', (size_t)READ_SPLIT - 3 - n);
+    n = READ_SPLIT - 3;
+    memcpy(seq + n, "\x1b[2", 3);
+    n += 3;
+    memcpy(seq + n, TAIL, sizeof TAIL - 1);
+    n += sizeof TAIL - 1;
+
+    int inp[2];
+    ASH_CHECK(pipe(inp) == 0);
+    write_all(inp[1], seq, n);
+    close(inp[1]);
+
+    char out[8192];
+    run_loop("http://127.0.0.1:1/", inp[0], out, sizeof out);
+    close(inp[0]);
+
+    ASH_CHECK(strstr(out, "PASTE") != NULL);
+    ASH_CHECK(strstr(out, "bye") != NULL);
 }
 
 static void test_split_escape(void)
@@ -1048,13 +1364,16 @@ void ash_diffview_set(ash_diffview *dv, const char *old, size_t oldlen,
     (void)newlen;
 }
 
+static const char MODAL_MARK[] = "MODALUP";
+
 void ash_diffview_render(ash_diffview *dv, ash_fb *fb, ash_rect rect,
                          const ash_diffview_theme *theme)
 {
     (void)dv;
-    (void)fb;
     (void)rect;
     (void)theme;
+    ash_style st = { ASH_RGBA_DEFAULT, ASH_RGBA_DEFAULT, ASH_ATTR_NONE };
+    ash_fb_put_text(fb, 0, 0, st, MODAL_MARK, sizeof MODAL_MARK - 1);
 }
 
 ash_diffview_action ash_diffview_key(ash_diffview *dv, ash_key k, int view_h)
@@ -1222,6 +1541,80 @@ static void confirm_case(int accept, const char *want)
     unsetenv(CONFIRM_MARK_ENV);
 }
 
+static void test_modal_leftover(void)
+{
+    char path[] = "/tmp/ash-modal-XXXXXX";
+    int tfd = mkstemp(path);
+    ASH_CHECK(tfd >= 0);
+    write_all(tfd, "alpha\n", 6);
+    close(tfd);
+
+    char mark[] = "/tmp/ash-modal-key-XXXXXX";
+    int kfd = mkstemp(mark);
+    ASH_CHECK(kfd >= 0);
+    close(kfd);
+
+    char cnt[] = "/tmp/ash-modal-cnt-XXXXXX";
+    int cfd = mkstemp(cnt);
+    ASH_CHECK(cfd >= 0);
+    close(cfd);
+
+    setenv(CONFIRM_ACCEPT_ENV, "0", 1);
+    setenv(CONFIRM_MARK_ENV, mark, 1);
+
+    static char body[4096];
+    edit_body(body, sizeof body, path);
+
+    int port;
+    int lfd = listen_loopback(&port);
+    ASH_CHECK(lfd >= 0);
+    pid_t spid = fork();
+    ASH_CHECK(spid >= 0);
+    if (spid == 0) {
+        serve_body(lfd, body);
+        close(lfd);
+        _exit(0);
+    }
+    close(lfd);
+
+    char url[64];
+    (void)snprintf(url, sizeof url, "http://127.0.0.1:%d/", port);
+    int mfd = -1;
+    pid_t lpid = spawn_loop_pty(url, &mfd);
+
+    write_str_all(mfd, "go\r");
+
+    static char out[1 << 18];
+    size_t got = 0;
+    out[0] = 0;
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, MODAL_MARK));
+
+    char seq[256];
+    int sn = snprintf(seq, sizeof seq, "\x03!printf x >>%s; echo RA''N\r", cnt);
+    ASH_CHECK(sn > 0 && (size_t)sn < sizeof seq);
+    write_str_all(mfd, seq);
+
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, "RAN"));
+
+    write_str_all(mfd, "/quit\r");
+    ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
+    close(mfd);
+
+    (void)waitpid(lpid, NULL, 0);
+    (void)waitpid(spid, NULL, 0);
+
+    char ran[64];
+    size_t rn = slurp(cnt, ran, sizeof ran);
+    ASH_CHECK(rn == 1);
+    ASH_CHECK_STREQ(ran, "x");
+
+    unlink(cnt);
+    unlink(mark);
+    unlink(path);
+    unsetenv(CONFIRM_ACCEPT_ENV);
+    unsetenv(CONFIRM_MARK_ENV);
+}
+
 static void test_confirm_reject(void)
 {
     confirm_case(0, "alpha\n");
@@ -1239,7 +1632,16 @@ int main(void)
     test_bang();
     test_error();
     test_cancel();
+    test_cancel_same_read();
+    test_paste_cancel_parsed();
+    test_paste_cancel_unfed();
+    test_headless_typeahead_discarded();
+    test_headless_midturn_discarded();
     test_queue_while_busy();
+    test_two_lines_one_write();
+    test_submit_then_eof_one_write();
+    test_two_submits_one_write();
+    test_paste_mark_split();
     test_split_escape();
     test_tool();
     test_tool_multi();
@@ -1253,6 +1655,7 @@ int main(void)
     test_clear_marker();
     test_confirm_reject();
     test_confirm_accept();
+    test_modal_leftover();
     ash_http_global_cleanup();
     return ash_test_done();
 }
