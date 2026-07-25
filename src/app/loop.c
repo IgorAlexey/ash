@@ -8,6 +8,7 @@
 #include <unistd.h>
 
 #include "ash/ai/provider.h"
+#include "ash/app/agent.h"
 #include "ash/app/bang.h"
 #include "ash/app/loop.h"
 #include "ash/app/queue.h"
@@ -38,20 +39,9 @@
 #include "ash/base/poison.h"
 
 enum { LOOP_STACK = 1u << 18 };
-enum { TOOL_OUT_CAP = 1u << 20 };
-enum { TOOL_BATCH_MAX = 64 };
 
 enum { SB_CELL_BUDGET = 8u << 20 };
 enum { SB_MAX_LINES = 8192 };
-
-struct tool_call {
-    const char *id;
-    const char *name;
-    const char *input;
-    size_t      ilen;
-};
-
-static const char TRUNC_MARK[] = "\n[output truncated]";
 
 #define ASH_CMDS \
     "  /help     list the commands\n" \
@@ -104,24 +94,20 @@ struct ash_loop {
 
     ash_provider_stream *stream;
     int              running;
-    int              canceled;
 
     ash_proc        *proc;
-    ash_buf          tool_out;
+    ash_buf         *tool_out;
     int              tool_done;
     int              child_exited;
     int              tool_truncated;
 
-    ash_msg         *msgs;
-    size_t           nmsgs;
-    size_t           msgcap;
+    ash_agent        agent;
+    int              msgs_this_turn;
 
     ash_log          log;
     int              has_log;
 
     ash_buf          line;
-    ash_buf          resp;
-    char             stop[32];
 
     ash_footer       footer;
 
@@ -165,16 +151,13 @@ static int64_t mono_ms(void)
     return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
-static void capture_usage(struct ash_loop *L)
+static void capture_usage(struct ash_loop *L, const ash_ai_usage *u)
 {
-    ash_ai_usage u;
-    if (ash_provider_usage(L->stream, &u) != ASH_OK)
-        return;
     const ash_model_info *mi = ash_model_find(L->pcfg.model);
-    double cost = mi != NULL ? ash_model_cost_usd(mi, &u) : 0.0;
-    ash_footer_add_usage(&L->footer, u.input_tokens, u.output_tokens, cost);
-    int64_t used = u.input_tokens + u.cache_read_input_tokens +
-                   u.cache_creation_input_tokens;
+    double cost = mi != NULL ? ash_model_cost_usd(mi, u) : 0.0;
+    ash_footer_add_usage(&L->footer, u->input_tokens, u->output_tokens, cost);
+    int64_t used = u->input_tokens + u->cache_read_input_tokens +
+                   u->cache_creation_input_tokens;
     ash_footer_set_context(&L->footer, used,
                            mi != NULL ? mi->context_window : 0);
 }
@@ -532,13 +515,6 @@ static void do_cut(struct ash_loop *L)
         ui_block_str(L, ASH_TS_INFO, "[selection truncated to 1 MiB]\n");
 }
 
-static void on_delta(void *ud, const char *text, size_t n)
-{
-    struct ash_loop *L = ud;
-    ash_buf_append(&L->resp, text, n);
-    ui_stream(L, ASH_TS_AGENT, text, n);
-}
-
 static void read_input(struct ash_loop *L)
 {
     ssize_t n;
@@ -641,11 +617,6 @@ static const char *arena_dup(ash_arena *a, const char *s, size_t len)
     return c;
 }
 
-static const char *session_dup(struct ash_loop *L, const char *s, size_t len)
-{
-    return arena_dup(&L->mem.session, s, len);
-}
-
 static void disable_log(struct ash_loop *L)
 {
     if (!L->has_log)
@@ -678,50 +649,6 @@ static void log_msg(struct ash_loop *L, const ash_msg *m)
         ash_log_append_turn(&L->log, b.data, (uint32_t)b.len) != ASH_OK)
         disable_log(L);
     ash_arena_rewind(&L->mem.scratch, mk);
-}
-
-static void push_msg(struct ash_loop *L, ash_msg m)
-{
-    if (L->nmsgs == L->msgcap) {
-        size_t nc = L->msgcap ? L->msgcap * 2 : 8;
-        ash_msg *nm = ash_array(&L->mem.session, ash_msg, nc);
-        if (L->nmsgs)
-            memcpy(nm, L->msgs, L->nmsgs * sizeof *nm);
-        L->msgs = nm;
-        L->msgcap = nc;
-    }
-    L->msgs[L->nmsgs++] = m;
-    log_msg(L, &L->msgs[L->nmsgs - 1]);
-}
-
-static void add_msg(struct ash_loop *L, const char *role,
-                    const char *content, size_t len)
-{
-    push_msg(L, (ash_msg){ .role = role, .content = session_dup(L, content, len) });
-}
-
-static void add_tool_use(struct ash_loop *L, const char *text, size_t text_len,
-                         const char *id, const char *name,
-                         const char *input, size_t input_len)
-{
-    push_msg(L, (ash_msg){
-        .role = "assistant",
-        .content = text_len ? session_dup(L, text, text_len) : NULL,
-        .tool_id = session_dup(L, id, strlen(id)),
-        .tool_name = session_dup(L, name, strlen(name)),
-        .tool_input = session_dup(L, input, input_len),
-    });
-}
-
-static void add_tool_result(struct ash_loop *L, const char *id,
-                            const char *result, size_t result_len, int is_error)
-{
-    push_msg(L, (ash_msg){
-        .role = "user",
-        .tool_id = session_dup(L, id, strlen(id)),
-        .tool_result = session_dup(L, result != NULL ? result : "", result_len),
-        .tool_is_error = is_error,
-    });
 }
 
 enum { RL_OK, RL_EOF };
@@ -843,76 +770,118 @@ static int read_line(ash_co *co, struct ash_loop *L)
     }
 }
 
-static void report_error(struct ash_loop *L)
+static void report_error(struct ash_loop *L, const char *text)
 {
     ash_arena_mark mk = ash_arena_mark_get(&L->mem.scratch);
     ash_buf b;
     ash_buf_init(&b, &L->mem.scratch);
     ash_buf_append_cstr(&b, "error: ");
-    ash_buf_append_cstr(&b, ash_errbuf);
+    ash_buf_append_cstr(&b, text);
     ash_buf_append_byte(&b, '\n');
     ui_block(L, ASH_TS_ERROR, (const char *)b.data, b.len);
     ash_arena_rewind(&L->mem.scratch, mk);
 }
 
-static void run_shell(ash_co *co, struct ash_loop *L, const char *cmd)
+static void loop_emit(void *ud, const ash_agent_event *ev)
 {
+    struct ash_loop *L = ud;
+    switch (ev->kind) {
+    case ASH_AGENT_TURN_START:
+        L->msgs_this_turn = 0;
+        return;
+    case ASH_AGENT_MSG_START:
+        if (!L->tui && L->msgs_this_turn > 0)
+            write_str(L, "\n");
+        L->msgs_this_turn++;
+        return;
+    case ASH_AGENT_TEXT:
+        ui_stream(L, ASH_TS_AGENT, ev->text, ev->len);
+        return;
+    case ASH_AGENT_MSG_END:
+        if (!L->tui)
+            write_str(L, "\n");
+        return;
+    case ASH_AGENT_USAGE:
+        capture_usage(L, ev->usage);
+        return;
+    case ASH_AGENT_MSG_APPEND:
+        log_msg(L, ev->msg);
+        return;
+    case ASH_AGENT_ERROR:
+        report_error(L, ev->text);
+        return;
+    case ASH_AGENT_TOOL_START:
+    case ASH_AGENT_TOOL_END:
+    case ASH_AGENT_TURN_END:
+        return;
+    }
+}
+
+static int loop_pump(void *ud, ash_provider_stream *s)
+{
+    struct ash_loop *L = ud;
+    int canceled = 0;
+    L->stream = s;
+    L->running = 1;
+    while (L->running) {
+        ash_co_yield(&L->co, ASH_WAIT_SSE);
+        if (L->inlen > 0 && busy_input(L)) {
+            canceled = 1;
+            break;
+        }
+    }
+    L->stream = NULL;
+    return canceled;
+}
+
+static int loop_shell(void *ud, const char *cmd, ash_buf *out)
+{
+    struct ash_loop *L = ud;
     ui_tool_head(L, cmd);
 
     const char *argv[] = { "sh", "-c", cmd, NULL };
     ash_proc p;
     if (ash_proc_spawn(&p, argv) != ASH_OK) {
-        ash_buf_append_cstr(&L->tool_out, "tool error: ");
-        ash_buf_append_cstr(&L->tool_out, ash_errbuf);
-        return;
+        ash_buf_append_cstr(out, "tool error: ");
+        ash_buf_append_cstr(out, ash_errbuf);
+        return 0;
     }
 
+    int canceled = 0;
     L->proc = &p;
+    L->tool_out = out;
     L->tool_done = 0;
     L->child_exited = 0;
     L->tool_truncated = 0;
     while (!L->tool_done) {
-        ash_co_yield(co, ASH_WAIT_TOOL);
+        ash_co_yield(&L->co, ASH_WAIT_TOOL);
         if (L->inlen > 0 && busy_input(L)) {
-            L->canceled = 1;
+            canceled = 1;
             break;
         }
     }
     L->proc = NULL;
+    L->tool_out = NULL;
 
-    if (L->canceled) {
+    if (canceled) {
         ash_proc_close(&p);
-        return;
+        return 1;
     }
     if (L->tool_truncated)
-        ash_buf_append_cstr(&L->tool_out, TRUNC_MARK);
+        ash_buf_append_cstr(out, ASH_AGENT_TRUNC_MARK);
     int code = 0;
     if (ash_proc_wait(&p, &code) == ASH_OK && code != 0) {
         char note[32];
         int nn = snprintf(note, sizeof note, "\n[exit %d]", code);
         if (nn > 0)
-            ash_buf_append(&L->tool_out, note, (size_t)nn);
+            ash_buf_append(out, note, (size_t)nn);
     }
     ash_proc_close(&p);
+    return 0;
 }
 
-static void run_tool(ash_co *co, struct ash_loop *L, const char *name,
-                     const char *input, size_t input_len)
-{
-    (void)name;
-    ash_arena_mark m = ash_arena_mark_get(&L->mem.scratch);
-    const char *cmd = NULL;
-    if (ash_bash_command(&L->mem.scratch, input, input_len, &cmd) != ASH_OK) {
-        ash_buf_append_cstr(&L->tool_out, "tool error: ");
-        ash_buf_append_cstr(&L->tool_out, ash_errbuf);
-        ash_arena_rewind(&L->mem.scratch, m);
-        return;
-    }
-    run_shell(co, L, cmd);
-    ash_arena_rewind(&L->mem.scratch, m);
-}
-
-static void bang_record(struct ash_loop *L, const char *cmd)
+static void bang_record(struct ash_loop *L, const char *cmd,
+                        const ash_buf *out, int canceled)
 {
     ash_arena_mark mk = ash_arena_mark_get(&L->mem.scratch);
     ash_buf b;
@@ -920,37 +889,37 @@ static void bang_record(struct ash_loop *L, const char *cmd)
     ash_buf_append_cstr(&b, "Ran `");
     ash_buf_append_cstr(&b, cmd);
     ash_buf_append_cstr(&b, "`\n");
-    if (L->tool_out.len > 0) {
+    if (out->len > 0) {
         ash_buf_append_cstr(&b, "```\n");
-        ash_buf_append(&b, L->tool_out.data, L->tool_out.len);
+        ash_buf_append(&b, out->data, out->len);
         ash_buf_append_cstr(&b, "\n```");
     } else {
         ash_buf_append_cstr(&b, "(no output)");
     }
-    if (L->canceled)
+    if (canceled)
         ash_buf_append_cstr(&b, "\n\n(command cancelled)");
-    add_msg(L, "user", (const char *)b.data, b.len);
+    ash_agent_user(&L->agent, (const char *)b.data, b.len);
     ash_arena_rewind(&L->mem.scratch, mk);
 }
 
-static void run_bang(ash_co *co, struct ash_loop *L, const char *cmd,
-                     size_t cmd_len)
+static int run_bang(struct ash_loop *L, const char *cmd, size_t cmd_len)
 {
     if (cmd_len == 0) {
         ui_block_str(L, ASH_TS_INFO, "usage: !<command>\n");
-        return;
+        return 0;
     }
     ash_arena_mark mk = ash_arena_mark_get(&L->mem.scratch);
     char *c = ash_array(&L->mem.scratch, char, cmd_len + 1);
     memcpy(c, cmd, cmd_len);
     c[cmd_len] = 0;
-    ash_buf_init(&L->tool_out, &L->mem.turn);
-    L->canceled = 0;
-    run_shell(co, L, c);
-    bang_record(L, c);
-    if (L->canceled)
+    ash_buf out;
+    ash_buf_init(&out, &L->mem.turn);
+    int canceled = loop_shell(L, c, &out);
+    bang_record(L, c, &out, canceled);
+    if (canceled)
         ui_block_str(L, ASH_TS_INFO, "[canceled]\n");
     ash_arena_rewind(&L->mem.scratch, mk);
+    return canceled;
 }
 
 static int line_is(const struct ash_loop *L, const char *cmd)
@@ -1357,8 +1326,7 @@ static ash_status loop_fn(ash_co *co, void *ud)
         size_t bcmd_len;
         if (ash_bang_split((const char *)L->line.data, L->line.len, &bcmd,
                            &bcmd_len)) {
-            run_bang(co, L, bcmd, bcmd_len);
-            if (L->canceled)
+            if (run_bang(L, bcmd, bcmd_len))
                 L->drain_suspended = 1;
             continue;
         }
@@ -1371,10 +1339,7 @@ static ash_status loop_fn(ash_co *co, void *ud)
             } else if (line_is(L, "/settings")) {
                 run_settings(L);
             } else if (line_is(L, "/clear")) {
-                ash_arena_reset(&L->mem.session);
-                L->msgs = NULL;
-                L->nmsgs = 0;
-                L->msgcap = 0;
+                ash_agent_reset(&L->agent);
                 if (L->has_log && ash_log_clear(&L->log) != ASH_OK)
                     disable_log(L);
                 if (L->tui) {
@@ -1395,119 +1360,10 @@ static ash_status loop_fn(ash_co *co, void *ud)
             continue;
         }
 
-        add_msg(L, "user", (const char *)L->line.data, L->line.len);
-        L->canceled = 0;
-
-        for (;;) {
-            ash_buf_init(&L->resp, &L->mem.turn);
-            L->stop[0] = 0;
-
-            if (ash_provider_start(&L->stream, &L->mem.turn, &L->pcfg, L->msgs,
-                                   L->nmsgs, on_delta, L, L->stop, sizeof L->stop)
-                != ASH_OK) {
-                report_error(L);
-                break;
-            }
-
-            L->running = 1;
-            while (L->running) {
-                ash_co_yield(co, ASH_WAIT_SSE);
-                if (L->inlen > 0 && busy_input(L)) {
-                    L->canceled = 1;
-                    break;
-                }
-            }
-
-            capture_usage(L);
-            ash_status fin = ash_provider_finish(L->stream);
-            struct tool_call calls[TOOL_BATCH_MAX];
-            int nc = ash_provider_tool_count(L->stream);
-            if (nc > TOOL_BATCH_MAX)
-                nc = TOOL_BATCH_MAX;
-            for (int i = 0; i < nc; i++) {
-                ash_status ts = ash_provider_tool_at(L->stream, i, &calls[i].id,
-                                                     &calls[i].name,
-                                                     &calls[i].input,
-                                                     &calls[i].ilen);
-                (void)ts;
-            }
-            ash_provider_stream_close(L->stream);
-            L->stream = NULL;
-            if (!L->tui)
-                write_str(L, "\n");
-
-            if (L->canceled) {
-                L->drain_suspended = 1;
-                ui_block_str(L, ASH_TS_INFO, "[canceled]\n");
-                break;
-            }
-            if (fin != ASH_OK) {
-                report_error(L);
-                break;
-            }
-
-            int is_tool = strcmp(L->stop, "tool_use") == 0 &&
-                          nc > 0 && calls[0].id != NULL && calls[0].id[0] != 0;
-            if (!is_tool) {
-                add_msg(L, "assistant", (const char *)L->resp.data, L->resp.len);
-                break;
-            }
-
-            for (int i = 0; i < nc; i++)
-                add_tool_use(L, i == 0 ? (const char *)L->resp.data : NULL,
-                             i == 0 ? L->resp.len : 0, calls[i].id, calls[i].name,
-                             calls[i].input, calls[i].ilen);
-
-            int canceled_at = -1;
-            for (int i = 0; i < nc; i++) {
-                const ash_tool *t = ash_tool_find(calls[i].name);
-                if (t == NULL) {
-                    ash_arena_mark mk = ash_arena_mark_get(&L->mem.scratch);
-                    ash_buf msg;
-                    ash_buf_init(&msg, &L->mem.scratch);
-                    ash_buf_append_cstr(&msg, "tool error: unknown tool '");
-                    ash_buf_append_cstr(&msg, calls[i].name ? calls[i].name : "");
-                    ash_buf_append_byte(&msg, '\'');
-                    add_tool_result(L, calls[i].id, (const char *)msg.data,
-                                    msg.len, 1);
-                    ash_arena_rewind(&L->mem.scratch, mk);
-                    continue;
-                }
-                if (t->run == NULL) {
-                    ash_buf_init(&L->tool_out, &L->mem.turn);
-                    run_tool(co, L, calls[i].name, calls[i].input, calls[i].ilen);
-                    if (L->canceled) {
-                        canceled_at = i;
-                        break;
-                    }
-                    add_tool_result(L, calls[i].id, (const char *)L->tool_out.data,
-                                    L->tool_out.len, 0);
-                    continue;
-                }
-                ash_arena_mark mk = ash_arena_mark_get(&L->mem.scratch);
-                ash_tool_result res = { 0 };
-                ash_status tst = ash_tool_dispatch(t, &L->mem.scratch,
-                                                   calls[i].input, calls[i].ilen,
-                                                   &res);
-                if (tst != ASH_OK)
-                    add_tool_result(L, calls[i].id, ash_errbuf,
-                                    strlen(ash_errbuf), 1);
-                else
-                    add_tool_result(L, calls[i].id, res.content ? res.content : "",
-                                    res.len, res.is_error);
-                ash_arena_rewind(&L->mem.scratch, mk);
-            }
-            if (canceled_at >= 0) {
-                L->drain_suspended = 1;
-                for (int i = canceled_at; i < nc; i++)
-                    add_tool_result(L, calls[i].id, "[canceled]",
-                                    strlen("[canceled]"), 1);
-                ui_block_str(L, ASH_TS_INFO, "[canceled]\n");
-                break;
-            }
-            if (!L->tui)
-                write_str(L, "\n");
-            ash_arena_reset(&L->mem.turn);
+        ash_agent_user(&L->agent, (const char *)L->line.data, L->line.len);
+        if (ash_agent_run(&L->agent) == ASH_AGENT_ABORTED) {
+            L->drain_suspended = 1;
+            ui_block_str(L, ASH_TS_INFO, "[canceled]\n");
         }
     }
 
@@ -1568,19 +1424,20 @@ static ash_status loop_run(struct ash_loop *L)
                 uint8_t tb[4096];
                 ssize_t n = read(ash_proc_out_fd(L->proc), tb, sizeof tb);
                 if (n > 0) {
-                    size_t room = TOOL_OUT_CAP > L->tool_out.len
-                                      ? TOOL_OUT_CAP - L->tool_out.len : 0;
+                    size_t room = ASH_AGENT_TOOL_OUT_CAP > L->tool_out->len
+                                      ? ASH_AGENT_TOOL_OUT_CAP - L->tool_out->len
+                                      : 0;
                     size_t take = (size_t)n < room ? (size_t)n : room;
                     while (take > 0 && take < (size_t)n &&
                            (tb[take] & 0xC0) == 0x80)
                         take--;
                     if (take) {
-                        ash_buf_append(&L->tool_out, tb, take);
+                        ash_buf_append(L->tool_out, tb, take);
                         ui_stream(L, ASH_TS_TOOL_OUT, (const char *)tb, take);
                     }
                     if ((size_t)n > take && !L->tool_truncated) {
-                        ui_stream(L, ASH_TS_TOOL_OUT, TRUNC_MARK,
-                                  strlen(TRUNC_MARK));
+                        ui_stream(L, ASH_TS_TOOL_OUT, ASH_AGENT_TRUNC_MARK,
+                                  strlen(ASH_AGENT_TRUNC_MARK));
                         L->tool_truncated = 1;
                     }
                 } else if (n == 0) {
@@ -1634,12 +1491,18 @@ ash_status ash_loop_run(const ash_loop_cfg *cfg, int in_fd, int out_fd)
     L->pcfg.system = arena_dup(&boot, cfg->system,
                                cfg->system ? strlen(cfg->system) : 0);
     L->pcfg.max_tokens = cfg->max_tokens;
-    L->pcfg.tools = ash_tools_schema();
+    const char *tools = NULL;
+    if (ash_tools_schema_build(&boot, &tools) != ASH_OK)
+        tools = ash_tools_schema();
+    L->pcfg.tools = tools;
     L->pcfg.oauth_token = cfg->oauth_token;
     L->pcfg.oauth_ctx = cfg->oauth_ctx;
     L->auth = cfg->auth;
     L->store_arena = cfg->store_arena;
     L->provider_name = cfg->provider != NULL ? cfg->provider->name : NULL;
+    ash_agent_host host = { .ud = L, .emit = loop_emit, .pump = loop_pump,
+                            .shell = loop_shell };
+    ash_agent_init(&L->agent, &L->mem, &L->pcfg, &host);
     ash_footer_init(&L->footer);
     ash_footer_set_provider(&L->footer,
                             cfg->provider != NULL ? cfg->provider->name : NULL,
@@ -1686,7 +1549,6 @@ ash_status ash_loop_run(const ash_loop_cfg *cfg, int in_fd, int out_fd)
         L->drain_suspended = 0;
         ash_textarea_init(&L->ta, &L->ui, L->wrap_w > 0 ? L->wrap_w : 80, 0);
     }
-
     ash_arena logarena;
     L->has_log = 0;
     if (cfg->session_path != NULL &&

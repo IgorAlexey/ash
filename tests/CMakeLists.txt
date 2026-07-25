@@ -185,6 +185,7 @@ target_link_libraries(proc_test PRIVATE ash_core)
 add_test(NAME proc_test COMMAND proc_test)
 
 add_executable(loop_test app/loop_test.c
+  ${CMAKE_SOURCE_DIR}/src/app/agent.c
   ${CMAKE_SOURCE_DIR}/src/app/loop.c
   ${CMAKE_SOURCE_DIR}/src/app/bang.c
   ${CMAKE_SOURCE_DIR}/src/app/transcript.c
@@ -232,7 +233,9 @@ target_compile_definitions(select_test PRIVATE
   ASH_GOLDEN_DIR="${CMAKE_SOURCE_DIR}/tests/app/golden")
 add_test(NAME select_test COMMAND select_test)
 
-add_executable(rpc_test app/rpc_test.c ${CMAKE_SOURCE_DIR}/src/app/rpc.c)
+add_executable(rpc_test app/rpc_test.c
+  ${CMAKE_SOURCE_DIR}/src/app/agent.c
+  ${CMAKE_SOURCE_DIR}/src/app/rpc.c)
 target_include_directories(rpc_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(rpc_test PRIVATE ash_tools)
 add_test(NAME rpc_test COMMAND rpc_test)

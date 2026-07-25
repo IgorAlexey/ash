@@ -5,6 +5,7 @@
 #include <unistd.h>
 
 #include "ash/ai/provider.h"
+#include "ash/app/agent.h"
 #include "ash/app/rpc.h"
 #include "ash/base/arena.h"
 #include "ash/base/buf.h"
@@ -14,19 +15,8 @@
 #include "ash/tools/tools.h"
 #include "ash/base/poison.h"
 
-enum { TOOL_OUT_CAP = 1u << 20 };
-enum { TOOL_BATCH_MAX = 64 };
 enum { LINE_MAX = 1u << 20 };
 enum { IN_CHUNK = 4096 };
-
-static const char TRUNC_MARK[] = "\n[output truncated]";
-
-struct tool_call {
-    const char *id;
-    const char *name;
-    const char *input;
-    size_t      ilen;
-};
 
 struct ash_rpc {
     ash_mem          mem;
@@ -39,15 +29,11 @@ struct ash_rpc {
     size_t           pending_len;
     int              in_eof;
 
-    ash_provider_stream *stream;
-    int              running;
     int              canceled;
 
-    ash_msg         *msgs;
-    size_t           nmsgs;
-    size_t           msgcap;
-
-    ash_buf          resp;
+    ash_agent        agent;
+    char             err[ASH_ERRBUF_CAP];
+    int              failed;
 };
 
 static void write_bytes(struct ash_rpc *R, const void *p, size_t n)
@@ -191,18 +177,19 @@ static void emit_error_event(struct ash_rpc *R, const char *msg)
     ash_arena_rewind(&R->mem.scratch, mk);
 }
 
-static void emit_tool_start(struct ash_rpc *R, const struct tool_call *c)
+static void emit_tool_start(struct ash_rpc *R, const char *id, const char *name,
+                            const char *input, size_t ilen)
 {
     ash_arena_mark mk = ash_arena_mark_get(&R->mem.scratch);
     ash_buf b;
     ash_buf_init(&b, &R->mem.scratch);
     event_open(&b, "tool_execution_start");
     ash_buf_append_byte(&b, ',');
-    field_str(&b, "id", c->id ? c->id : "", c->id ? strlen(c->id) : 0);
+    field_str(&b, "id", id ? id : "", id ? strlen(id) : 0);
     ash_buf_append_byte(&b, ',');
-    field_str(&b, "name", c->name ? c->name : "", c->name ? strlen(c->name) : 0);
+    field_str(&b, "name", name ? name : "", name ? strlen(name) : 0);
     ash_buf_append_cstr(&b, ",\"input\":");
-    append_input(R, &b, c->input, c->ilen);
+    append_input(R, &b, input, ilen);
     ash_buf_append_byte(&b, '}');
     emit_line(R, &b);
     ash_arena_rewind(&R->mem.scratch, mk);
@@ -267,53 +254,6 @@ static const char *arena_dup(ash_arena *a, const char *s, size_t len)
     memcpy(c, s, len);
     c[len] = 0;
     return c;
-}
-
-static const char *session_dup(struct ash_rpc *R, const char *s, size_t len)
-{
-    return arena_dup(&R->mem.session, s, len);
-}
-
-static void push_msg(struct ash_rpc *R, ash_msg m)
-{
-    if (R->nmsgs == R->msgcap) {
-        size_t nc = R->msgcap ? R->msgcap * 2 : 8;
-        ash_msg *nm = ash_array(&R->mem.session, ash_msg, nc);
-        if (R->nmsgs)
-            memcpy(nm, R->msgs, R->nmsgs * sizeof *nm);
-        R->msgs = nm;
-        R->msgcap = nc;
-    }
-    R->msgs[R->nmsgs++] = m;
-}
-
-static void add_msg(struct ash_rpc *R, const char *role,
-                    const char *content, size_t len)
-{
-    push_msg(R, (ash_msg){ .role = role, .content = session_dup(R, content, len) });
-}
-
-static void add_tool_use(struct ash_rpc *R, const char *text, size_t text_len,
-                         const struct tool_call *c)
-{
-    push_msg(R, (ash_msg){
-        .role = "assistant",
-        .content = text_len ? session_dup(R, text, text_len) : NULL,
-        .tool_id = session_dup(R, c->id, strlen(c->id)),
-        .tool_name = session_dup(R, c->name, strlen(c->name)),
-        .tool_input = session_dup(R, c->input, c->ilen),
-    });
-}
-
-static void add_tool_result(struct ash_rpc *R, const char *id,
-                            const char *result, size_t result_len, int is_error)
-{
-    push_msg(R, (ash_msg){
-        .role = "user",
-        .tool_id = session_dup(R, id, strlen(id)),
-        .tool_result = session_dup(R, result, result_len),
-        .tool_is_error = is_error,
-    });
 }
 
 ash_status ash_rpc_parse(ash_arena *a, const char *line, size_t len,
@@ -438,25 +378,15 @@ static void drain_input(struct ash_rpc *R)
     }
 }
 
-static void run_bash(struct ash_rpc *R, const char *input, size_t ilen,
-                     ash_buf *out)
+static int rpc_shell(void *ud, const char *cmd, ash_buf *out)
 {
-    ash_arena_mark mk = ash_arena_mark_get(&R->mem.scratch);
-    const char *cmd = NULL;
-    if (ash_bash_command(&R->mem.scratch, input, ilen, &cmd) != ASH_OK) {
-        ash_buf_append_cstr(out, "tool error: ");
-        ash_buf_append_cstr(out, ash_errbuf);
-        ash_arena_rewind(&R->mem.scratch, mk);
-        return;
-    }
-
+    struct ash_rpc *R = ud;
     const char *argv[] = { "sh", "-c", cmd, NULL };
     ash_proc p;
     if (ash_proc_spawn(&p, argv) != ASH_OK) {
         ash_buf_append_cstr(out, "tool error: ");
         ash_buf_append_cstr(out, ash_errbuf);
-        ash_arena_rewind(&R->mem.scratch, mk);
-        return;
+        return 0;
     }
 
     int done = 0, child_exited = 0, truncated = 0;
@@ -488,7 +418,8 @@ static void run_bash(struct ash_rpc *R, const char *input, size_t ilen,
             uint8_t tb[4096];
             ssize_t n = read(ash_proc_out_fd(&p), tb, sizeof tb);
             if (n > 0) {
-                size_t room = TOOL_OUT_CAP > out->len ? TOOL_OUT_CAP - out->len : 0;
+                size_t room = ASH_AGENT_TOOL_OUT_CAP > out->len
+                                  ? ASH_AGENT_TOOL_OUT_CAP - out->len : 0;
                 size_t take = (size_t)n < room ? (size_t)n : room;
                 if (take)
                     ash_buf_append(out, tb, take);
@@ -511,159 +442,97 @@ static void run_bash(struct ash_rpc *R, const char *input, size_t ilen,
 
     if (R->canceled) {
         ash_proc_close(&p);
-    } else {
-        if (truncated)
-            ash_buf_append_cstr(out, TRUNC_MARK);
-        int code = 0;
-        if (ash_proc_wait(&p, &code) == ASH_OK && code != 0) {
-            char note[32];
-            int nn = snprintf(note, sizeof note, "\n[exit %d]", code);
-            if (nn > 0)
-                ash_buf_append(out, note, (size_t)nn);
-        }
-        ash_proc_close(&p);
+        return 1;
     }
-    ash_arena_rewind(&R->mem.scratch, mk);
+    if (truncated)
+        ash_buf_append_cstr(out, ASH_AGENT_TRUNC_MARK);
+    int code = 0;
+    if (ash_proc_wait(&p, &code) == ASH_OK && code != 0) {
+        char note[32];
+        int nn = snprintf(note, sizeof note, "\n[exit %d]", code);
+        if (nn > 0)
+            ash_buf_append(out, note, (size_t)nn);
+    }
+    ash_proc_close(&p);
+    return 0;
 }
 
-static void on_delta(void *ud, const char *text, size_t n)
+static int rpc_pump(void *ud, ash_provider_stream *s)
 {
     struct ash_rpc *R = ud;
-    ash_buf_append(&R->resp, text, n);
-    emit_update(R, text, n);
+    int running = 1;
+    while (running) {
+        int ready = 0;
+        int wfd = R->in_eof ? -1 : R->in_fd;
+        ash_status st = ash_provider_wait(s, wfd, 1000, &ready);
+        if (st == ASH_OK)
+            st = ash_provider_pump(s, &running);
+        if (st != ASH_OK)
+            running = 0;
+        if (ready)
+            drain_input(R);
+        if (R->canceled)
+            break;
+    }
+    return R->canceled;
 }
 
-static void run_turn(struct ash_rpc *R, ash_slice command, ash_slice id,
-                     ash_slice message)
+static void rpc_emit(void *ud, const ash_agent_event *ev)
 {
-    add_msg(R, "user", message.p ? message.p : "", message.p ? message.len : 0);
-    R->canceled = 0;
-    emit_event(R, "turn_start");
-
-    for (;;) {
-        ash_buf_init(&R->resp, &R->mem.turn);
-        char stop[32];
-        stop[0] = 0;
+    struct ash_rpc *R = ud;
+    switch (ev->kind) {
+    case ASH_AGENT_TURN_START:
+        emit_event(R, "turn_start");
+        return;
+    case ASH_AGENT_MSG_START:
         emit_event(R, "message_start");
-
-        if (ash_provider_start(&R->stream, &R->mem.turn, &R->pcfg, R->msgs,
-                               R->nmsgs, on_delta, R, stop, sizeof stop)
-            != ASH_OK) {
-            emit_error_event(R, ash_errbuf);
-            emit_response_err(R, command, id, ash_errbuf);
-            return;
-        }
-
-        R->running = 1;
-        while (R->running) {
-            int ready = 0;
-            int wfd = R->in_eof ? -1 : R->in_fd;
-            ash_status st = ash_provider_wait(R->stream, wfd, 1000, &ready);
-            if (st == ASH_OK)
-                st = ash_provider_pump(R->stream, &R->running);
-            if (st != ASH_OK)
-                R->running = 0;
-            if (ready)
-                drain_input(R);
-            if (R->canceled)
-                break;
-        }
-
-        ash_status fin = ash_provider_finish(R->stream);
-        struct tool_call calls[TOOL_BATCH_MAX];
-        int nc = ash_provider_tool_count(R->stream);
-        if (nc > TOOL_BATCH_MAX)
-            nc = TOOL_BATCH_MAX;
-        for (int i = 0; i < nc; i++) {
-            ash_status ts = ash_provider_tool_at(R->stream, i, &calls[i].id,
-                                                 &calls[i].name, &calls[i].input,
-                                                 &calls[i].ilen);
-            (void)ts;
-        }
-        ash_provider_stream_close(R->stream);
-        R->stream = NULL;
-
-        if (R->canceled) {
-            emit_message_end(R, "aborted");
+        return;
+    case ASH_AGENT_TEXT:
+        emit_update(R, ev->text, ev->len);
+        return;
+    case ASH_AGENT_MSG_END:
+        emit_message_end(R, ev->text);
+        return;
+    case ASH_AGENT_TOOL_START:
+        emit_tool_start(R, ev->id, ev->name, ev->text, ev->len);
+        return;
+    case ASH_AGENT_TOOL_END:
+        emit_tool_end(R, ev->id, ev->text, ev->len, ev->is_error);
+        return;
+    case ASH_AGENT_ERROR:
+        R->failed = 1;
+        snprintf(R->err, sizeof R->err, "%s", ev->text);
+        emit_error_event(R, ev->text);
+        return;
+    case ASH_AGENT_TURN_END:
+        if (!R->failed)
             emit_event(R, "turn_end");
-            emit_response_err(R, command, id, "aborted");
-            return;
-        }
-        if (fin != ASH_OK) {
-            emit_message_end(R, "error");
-            emit_error_event(R, ash_errbuf);
-            emit_response_err(R, command, id, ash_errbuf);
-            return;
-        }
-
-        emit_message_end(R, stop[0] ? stop : "end_turn");
-
-        int is_tool = strcmp(stop, "tool_use") == 0 &&
-                      nc > 0 && calls[0].id != NULL && calls[0].id[0] != 0;
-        if (!is_tool) {
-            add_msg(R, "assistant", (const char *)R->resp.data, R->resp.len);
-            emit_event(R, "turn_end");
-            emit_response_ok(R, command, id);
-            return;
-        }
-
-        for (int i = 0; i < nc; i++)
-            add_tool_use(R, i == 0 ? (const char *)R->resp.data : NULL,
-                         i == 0 ? R->resp.len : 0, &calls[i]);
-
-        int canceled_at = -1;
-        for (int i = 0; i < nc; i++) {
-            emit_tool_start(R, &calls[i]);
-            const ash_tool *t = ash_tool_find(calls[i].name);
-            if (t == NULL) {
-                ash_arena_mark mk = ash_arena_mark_get(&R->mem.scratch);
-                ash_buf msg;
-                ash_buf_init(&msg, &R->mem.scratch);
-                ash_buf_append_cstr(&msg, "tool error: unknown tool '");
-                ash_buf_append_cstr(&msg, calls[i].name ? calls[i].name : "");
-                ash_buf_append_byte(&msg, '\'');
-                add_tool_result(R, calls[i].id, (const char *)msg.data, msg.len, 1);
-                emit_tool_end(R, calls[i].id, (const char *)msg.data, msg.len, 1);
-                ash_arena_rewind(&R->mem.scratch, mk);
-                continue;
-            }
-            if (t->run == NULL) {
-                ash_buf out;
-                ash_buf_init(&out, &R->mem.turn);
-                run_bash(R, calls[i].input, calls[i].ilen, &out);
-                if (R->canceled) {
-                    canceled_at = i;
-                    break;
-                }
-                add_tool_result(R, calls[i].id, (const char *)out.data, out.len, 0);
-                emit_tool_end(R, calls[i].id, (const char *)out.data, out.len, 0);
-                continue;
-            }
-            ash_arena_mark mk = ash_arena_mark_get(&R->mem.scratch);
-            ash_tool_result res = { 0 };
-            ash_status tst = ash_tool_dispatch(t, &R->mem.scratch, calls[i].input,
-                                               calls[i].ilen, &res);
-            if (tst != ASH_OK) {
-                add_tool_result(R, calls[i].id, ash_errbuf, strlen(ash_errbuf), 1);
-                emit_tool_end(R, calls[i].id, ash_errbuf, strlen(ash_errbuf), 1);
-            } else {
-                const char *rc = res.content ? res.content : "";
-                add_tool_result(R, calls[i].id, rc, res.len, res.is_error);
-                emit_tool_end(R, calls[i].id, rc, res.len, res.is_error);
-            }
-            ash_arena_rewind(&R->mem.scratch, mk);
-        }
-        if (canceled_at >= 0) {
-            for (int i = canceled_at; i < nc; i++) {
-                add_tool_result(R, calls[i].id, "[canceled]", strlen("[canceled]"), 1);
-                emit_tool_end(R, calls[i].id, "[canceled]", strlen("[canceled]"), 1);
-            }
-            emit_event(R, "turn_end");
-            emit_response_err(R, command, id, "aborted");
-            return;
-        }
-        ash_arena_reset(&R->mem.turn);
+        return;
+    case ASH_AGENT_USAGE:
+    case ASH_AGENT_MSG_APPEND:
+        return;
     }
+}
+
+static void run_prompt(struct ash_rpc *R, ash_slice command, ash_slice id,
+                       ash_slice message)
+{
+    R->canceled = 0;
+    R->failed = 0;
+    R->err[0] = 0;
+    ash_agent_user(&R->agent, message.p ? message.p : "",
+                   message.p ? message.len : 0);
+
+    ash_agent_outcome oc = ash_agent_run(&R->agent);
+    if (oc == ASH_AGENT_DONE) {
+        emit_response_ok(R, command, id);
+        return;
+    }
+    if (oc == ASH_AGENT_ABORTED) {
+        emit_response_err(R, command, id, "aborted");
+        return;
+    }
+    emit_response_err(R, command, id, R->err);
 }
 
 static void emit_state(struct ash_rpc *R, ash_slice command, ash_slice id)
@@ -680,7 +549,7 @@ static void emit_state(struct ash_rpc *R, ash_slice command, ash_slice id)
     field_str(&b, "model", mn, strlen(mn));
     ash_buf_append_cstr(&b, ",\"streaming\":false,\"message_count\":");
     char num[24];
-    int nn = snprintf(num, sizeof num, "%zu", R->nmsgs);
+    int nn = snprintf(num, sizeof num, "%zu", ash_agent_msg_count(&R->agent));
     if (nn > 0)
         ash_buf_append(&b, num, (size_t)nn);
     ash_buf_append_cstr(&b, "}}");
@@ -695,8 +564,9 @@ static void emit_messages(struct ash_rpc *R, ash_slice command, ash_slice id)
     ash_buf_init(&b, &R->mem.scratch);
     response_open(&b, command, id);
     ash_buf_append_cstr(&b, ",\"success\":true,\"data\":{\"messages\":[");
-    for (size_t i = 0; i < R->nmsgs; i++) {
-        const ash_msg *m = &R->msgs[i];
+    size_t nmsgs = ash_agent_msg_count(&R->agent);
+    for (size_t i = 0; i < nmsgs; i++) {
+        const ash_msg *m = ash_agent_msg_at(&R->agent, i);
         if (i)
             ash_buf_append_byte(&b, ',');
         ash_buf_append_byte(&b, '{');
@@ -735,14 +605,6 @@ static void emit_messages(struct ash_rpc *R, ash_slice command, ash_slice id)
     ash_arena_rewind(&R->mem.scratch, mk);
 }
 
-static void new_session(struct ash_rpc *R)
-{
-    ash_arena_reset(&R->mem.session);
-    R->msgs = NULL;
-    R->nmsgs = 0;
-    R->msgcap = 0;
-}
-
 static void handle_command(struct ash_rpc *R, const char *line, size_t len)
 {
     ash_rpc_cmd c;
@@ -753,7 +615,7 @@ static void handle_command(struct ash_rpc *R, const char *line, size_t len)
     }
     switch (c.kind) {
     case ASH_RPC_PROMPT:
-        run_turn(R, c.type, c.id, c.message);
+        run_prompt(R, c.type, c.id, c.message);
         return;
     case ASH_RPC_ABORT:
         emit_response_ok(R, c.type, c.id);
@@ -765,7 +627,7 @@ static void handle_command(struct ash_rpc *R, const char *line, size_t len)
         emit_messages(R, c.type, c.id);
         return;
     case ASH_RPC_NEW_SESSION:
-        new_session(R);
+        ash_agent_reset(&R->agent);
         emit_response_ok(R, c.type, c.id);
         return;
     case ASH_RPC_UNKNOWN:
@@ -802,9 +664,15 @@ ash_status ash_rpc_run(const ash_loop_cfg *cfg, int in_fd, int out_fd)
     R->pcfg.system = arena_dup(&boot, cfg->system,
                                cfg->system ? strlen(cfg->system) : 0);
     R->pcfg.max_tokens = cfg->max_tokens;
-    R->pcfg.tools = ash_tools_schema();
+    const char *tools = NULL;
+    if (ash_tools_schema_build(&boot, &tools) != ASH_OK)
+        tools = ash_tools_schema();
+    R->pcfg.tools = tools;
     R->pcfg.oauth_token = cfg->oauth_token;
     R->pcfg.oauth_ctx = cfg->oauth_ctx;
+    ash_agent_host host = { .ud = R, .emit = rpc_emit, .pump = rpc_pump,
+                            .shell = rpc_shell };
+    ash_agent_init(&R->agent, &R->mem, &R->pcfg, &host);
     ash_provider_scrub_env();
 
     for (;;) {

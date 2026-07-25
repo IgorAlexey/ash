@@ -125,6 +125,7 @@ target_link_libraries(ash_ext PUBLIC ash_tools lua54)
 
 add_executable(ash
   src/app/main.c
+  src/app/agent.c
   src/app/loop.c
   src/app/bang.c
   src/app/transcript.c
