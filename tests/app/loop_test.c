@@ -277,6 +277,7 @@ static int pty_read_until(int mfd, char *out, size_t cap, size_t *got,
 }
 
 enum { SERVE_TIMEOUT_S = 30 };
+enum { CHILD_WAIT_MS = 60000, CHILD_POLL_MS = 10 };
 enum { SERVE_WRITE_FAILED = 21, SERVE_NO_SIGPIPE = 22 };
 
 static void ignore_sigpipe(void)
@@ -320,15 +321,23 @@ static void wait_check(pid_t pid, const char *role, int server,
                        const char *file, int line)
 {
     char msg[160];
+    int64_t deadline = now_ms() + CHILD_WAIT_MS;
     int st = 0;
     int err;
     pid_t r;
 
     msg[0] = 0;
-    while ((r = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
-        ;
+    while ((r = waitpid(pid, &st, WNOHANG)) == 0 && now_ms() < deadline)
+        nap(CHILD_POLL_MS);
     err = errno;
-    if (r < 0) {
+    if (r == 0) {
+        (void)kill(pid, SIGKILL);
+        while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+            ;
+        (void)snprintf(msg, sizeof msg,
+                       "%s was still running after %d seconds, killed", role,
+                       CHILD_WAIT_MS / 1000);
+    } else if (r < 0) {
         (void)snprintf(msg, sizeof msg, "%s: waitpid failed: %s", role,
                        strerror(err));
     } else if (WIFSIGNALED(st)) {
