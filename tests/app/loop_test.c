@@ -314,6 +314,44 @@ static pid_t fork_server(void)
     return pid;
 }
 
+static void wait_check(pid_t pid, const char *role, int server,
+                       const char *file, int line)
+{
+    char msg[160];
+    int st = 0;
+    int err;
+    pid_t r;
+
+    msg[0] = 0;
+    while ((r = waitpid(pid, &st, 0)) < 0 && errno == EINTR)
+        ;
+    err = errno;
+    if (r < 0) {
+        (void)snprintf(msg, sizeof msg, "%s: waitpid failed: %s", role,
+                       strerror(err));
+    } else if (WIFSIGNALED(st)) {
+        (void)snprintf(msg, sizeof msg, "%s died on signal %d", role,
+                       WTERMSIG(st));
+    } else if (!WIFEXITED(st)) {
+        (void)snprintf(msg, sizeof msg, "%s ended with wait status 0x%x", role,
+                       (unsigned)st);
+    } else if (server && WEXITSTATUS(st) == SERVE_WRITE_FAILED) {
+        (void)snprintf(msg, sizeof msg, "%s exited %d, lost a write", role,
+                       SERVE_WRITE_FAILED);
+    } else if (server && WEXITSTATUS(st) == SERVE_NO_SIGPIPE) {
+        (void)snprintf(msg, sizeof msg, "%s exited %d, could not ignore SIGPIPE",
+                       role, SERVE_NO_SIGPIPE);
+    } else if (WEXITSTATUS(st) != 0) {
+        (void)snprintf(msg, sizeof msg, "%s exited %d", role, WEXITSTATUS(st));
+    }
+
+    ash_test_check(msg[0] == 0, msg[0] == 0 ? "child finished cleanly" : msg,
+                   file, line);
+}
+
+#define WAIT_SERVER(pid)     wait_check((pid), "server", 1, __FILE__, __LINE__)
+#define WAIT_ROLE(pid, role) wait_check((pid), (role), 0, __FILE__, __LINE__)
+
 static int write_all(int c, const char *p, size_t n)
 {
     size_t off = 0;
@@ -525,7 +563,7 @@ static void test_happy(void)
     ASH_CHECK(strstr(out, "hello") != NULL);
     ASH_CHECK(strstr(out, "Hello, world") != NULL);
     ASH_CHECK(strstr(out, "bye") != NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_error(void)
@@ -553,7 +591,7 @@ static void test_error(void)
 
     ASH_CHECK(strstr(out, "error:") != NULL);
     ASH_CHECK(strstr(out, "Overloaded") != NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_cancel(void)
@@ -589,8 +627,8 @@ static void test_cancel(void)
     close(inp[0]);
 
     ASH_CHECK(strstr(out, "[canceled]") != NULL);
-    (void)waitpid(wpid, NULL, 0);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_ROLE(wpid, "writer");
+    WAIT_SERVER(spid);
 }
 
 static void test_cancel_same_read(void)
@@ -617,7 +655,7 @@ static void test_cancel_same_read(void)
     close(inp[0]);
 
     ASH_CHECK(strstr(out, "[canceled]") != NULL);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_SERVER(spid);
 }
 
 static void paste_cancel_case(const char *seq, size_t n)
@@ -646,7 +684,7 @@ static void paste_cancel_case(const char *seq, size_t n)
 
     ASH_CHECK(strstr(out, "[canceled]") == NULL);
     ASH_CHECK(strstr(out, "Hello, world") != NULL);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_SERVER(spid);
 }
 
 static void test_paste_cancel_parsed(void)
@@ -699,7 +737,7 @@ static void headless_typeahead_case(const char *seq, size_t n)
     ASH_CHECK(strstr(out, "Hello, world") != NULL);
     ASH_CHECK(strstr(out, "LATER") == NULL);
     ASH_CHECK(strstr(out, "bye") != NULL);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_SERVER(spid);
 }
 
 static void test_headless_typeahead_discarded(void)
@@ -799,9 +837,9 @@ static void test_queue_while_busy(void)
     ASH_CHECK(first < second);
     ASH_CHECK(strstr(out, "SECONDTURN") != NULL);
 
-    (void)waitpid(wpid, NULL, 0);
-    (void)waitpid(lpid, NULL, 0);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_ROLE(wpid, "writer");
+    WAIT_ROLE(lpid, "loop");
+    WAIT_SERVER(spid);
 }
 
 static pid_t spawn_loop_pty(const char *url, int *master)
@@ -858,7 +896,7 @@ static void test_two_lines_one_write(void)
     ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
     close(mfd);
 
-    (void)waitpid(lpid, NULL, 0);
+    WAIT_ROLE(lpid, "loop");
 }
 
 static void test_submit_then_eof_one_write(void)
@@ -879,7 +917,7 @@ static void test_submit_then_eof_one_write(void)
     ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
     close(mfd);
 
-    (void)waitpid(lpid, NULL, 0);
+    WAIT_ROLE(lpid, "loop");
 }
 
 static void test_two_submits_one_write(void)
@@ -907,7 +945,7 @@ static void test_two_submits_one_write(void)
     ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
     close(mfd);
 
-    (void)waitpid(lpid, NULL, 0);
+    WAIT_ROLE(lpid, "loop");
 }
 
 static void test_paste_mark_split(void)
@@ -965,7 +1003,7 @@ static void test_transport_error(void)
     ASH_CHECK(strstr(out, "error:") != NULL);
     ASH_CHECK(strstr(out, "transfer failed") != NULL);
     ASH_CHECK(strstr(out, "http status 0") == NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_split_escape(void)
@@ -1003,8 +1041,8 @@ static void test_split_escape(void)
     ASH_CHECK(strstr(out, "hiworld") != NULL);
     ASH_CHECK(strstr(out, "\x1b[D") == NULL);
     ASH_CHECK(strstr(out, "Hello, world") != NULL);
-    (void)waitpid(wpid, NULL, 0);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_ROLE(wpid, "writer");
+    WAIT_SERVER(spid);
 }
 
 static void test_tool(void)
@@ -1034,7 +1072,7 @@ static void test_tool(void)
     ASH_CHECK(strstr(out, "echo TOOLTEST") != NULL);
     ASH_CHECK(strstr(out, "TOOLTEST\n") != NULL || strstr(out, "TOOLTEST\r") != NULL);
     ASH_CHECK(strstr(out, "Ran the tool.") != NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_tool_multi(void)
@@ -1065,7 +1103,7 @@ static void test_tool_multi(void)
     ASH_CHECK(strstr(out, "TOOLTEST") != NULL);
     ASH_CHECK(strstr(out, "ROUND2") != NULL);
     ASH_CHECK(strstr(out, "Ran the tool.") != NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_tool_parallel(void)
@@ -1095,7 +1133,7 @@ static void test_tool_parallel(void)
     ASH_CHECK(strstr(out, "PARA_AAA") != NULL);
     ASH_CHECK(strstr(out, "PARA_BBB") != NULL);
     ASH_CHECK(strstr(out, "Ran the tool.") != NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_env_scrub(void)
@@ -1126,7 +1164,7 @@ static void test_env_scrub(void)
 
     ASH_CHECK(strstr(out, "scrub=-end") != NULL);
     ASH_CHECK(strstr(out, "SECRETVALUE") == NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_tool_survivor(void)
@@ -1155,7 +1193,7 @@ static void test_tool_survivor(void)
 
     ASH_CHECK(strstr(out, "SURVIVOR") != NULL);
     ASH_CHECK(strstr(out, "Ran the tool.") != NULL);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_tool_bigout(void)
@@ -1204,7 +1242,7 @@ static void test_tool_bigout(void)
     ASH_CHECK(strstr(buf, "Ran the tool.") != NULL);
     free(buf);
     close(outfd);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_slash(void)
@@ -1232,7 +1270,7 @@ static void test_slash(void)
     ASH_CHECK(strstr(out, "commands:") != NULL);
     ASH_CHECK(strstr(out, "conversation cleared") != NULL);
     ASH_CHECK(strstr(out, "bye") != NULL);
-    (void)waitpid(wpid, NULL, 0);
+    WAIT_ROLE(wpid, "writer");
 }
 
 static void test_one_screen(void)
@@ -1313,7 +1351,7 @@ static void test_session(void)
     ASH_CHECK(memmem(logbuf, (size_t)ln, "tool_result\tTOOLTEST", 20) != NULL);
     ASH_CHECK(memmem(logbuf, (size_t)ln, "assistant\tRan the tool.", 23) != NULL);
     unlink(spath);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_SERVER(pid);
 }
 
 static void test_clear_marker(void)
@@ -1384,8 +1422,8 @@ static void test_clear_marker(void)
     ASH_CHECK(marks == 1);
 
     unlink(spath);
-    (void)waitpid(wpid, NULL, 0);
-    (void)waitpid(pid, NULL, 0);
+    WAIT_ROLE(wpid, "writer");
+    WAIT_SERVER(pid);
 }
 
 static void test_bang(void)
@@ -1607,9 +1645,9 @@ static void confirm_case(int accept, const char *want)
     }
     close(mfd);
 
-    (void)waitpid(wpid, NULL, 0);
-    (void)waitpid(lpid, NULL, 0);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_ROLE(wpid, "writer");
+    WAIT_ROLE(lpid, "loop");
+    WAIT_SERVER(spid);
 
     char keys[64];
     ASH_CHECK(slurp(mark, keys, sizeof keys) > 0);
@@ -1681,8 +1719,8 @@ static void test_modal_leftover(void)
     ASH_CHECK(pty_read_until(mfd, out, sizeof out, &got, NULL));
     close(mfd);
 
-    (void)waitpid(lpid, NULL, 0);
-    (void)waitpid(spid, NULL, 0);
+    WAIT_ROLE(lpid, "loop");
+    WAIT_SERVER(spid);
 
     char ran[64];
     size_t rn = slurp(cnt, ran, sizeof ran);
