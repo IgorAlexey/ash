@@ -1388,23 +1388,25 @@ static ash_status loop_fn(ash_co *co, void *ud)
             write_str(L, "> ");
         }
 
-        if (L->tui && !L->drain_suspended && ash_queue_count(&L->queue) > 0) {
-            const char *qs = NULL;
-            size_t qlen = 0;
-            ash_queue_pop(&L->queue, &qs, &qlen);
-            ash_buf_init(&L->line, &L->mem.turn);
-            ash_buf_append(&L->line, qs, qlen);
-            const char *qbc;
-            size_t qbl;
-            if (!ash_bang_split((const char *)L->line.data, L->line.len,
-                                &qbc, &qbl))
-                ui_user(L, (const char *)L->line.data, L->line.len);
-        } else {
-            if (read_line(co, L) == RL_EOF)
-                break;
-            L->drain_suspended = 0;
-            if (L->line.len == 0)
-                continue;
+        {
+            const char *qs;
+            size_t qlen;
+            if (L->tui && !L->drain_suspended &&
+                ash_queue_pop(&L->queue, &qs, &qlen)) {
+                ash_buf_init(&L->line, &L->mem.turn);
+                ash_buf_append(&L->line, qs, qlen);
+                const char *qbc;
+                size_t qbl;
+                if (!ash_bang_split((const char *)L->line.data, L->line.len,
+                                    &qbc, &qbl))
+                    ui_user(L, (const char *)L->line.data, L->line.len);
+            } else {
+                if (read_line(co, L) == RL_EOF)
+                    break;
+                L->drain_suspended = 0;
+                if (L->line.len == 0)
+                    continue;
+            }
         }
 
         const char *bcmd;

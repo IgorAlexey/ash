@@ -1,6 +1,7 @@
 #ifndef ASH_APP_QUEUE_H
 #define ASH_APP_QUEUE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 #include "ash/base/api.h"
@@ -23,7 +24,7 @@ typedef struct ash_queue {
 
 ASH_API void   ash_queue_init(ash_queue *q, ash_arena *arena);
 ASH_API void   ash_queue_push(ash_queue *q, const char *text, size_t len);
-ASH_API int    ash_queue_pop(ash_queue *q, const char **text, size_t *len);
+ASH_API bool   ash_queue_pop(ash_queue *q, const char **text, size_t *len);
 ASH_API size_t ash_queue_count(const ash_queue *q);
 ASH_API const char *ash_queue_at(const ash_queue *q, size_t i, size_t *len);
 ASH_API void   ash_queue_clear(ash_queue *q);

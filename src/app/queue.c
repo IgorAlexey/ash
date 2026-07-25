@@ -47,16 +47,16 @@ void ash_queue_push(ash_queue *q, const char *text, size_t len)
     q->tail++;
 }
 
-int ash_queue_pop(ash_queue *q, const char **text, size_t *len)
+bool ash_queue_pop(ash_queue *q, const char **text, size_t *len)
 {
     if (q->head == q->tail)
-        return 0;
+        return false;
     if (text != NULL)
         *text = q->items[q->head].text;
     if (len != NULL)
         *len = q->items[q->head].len;
     q->head++;
-    return 1;
+    return true;
 }
 
 size_t ash_queue_count(const ash_queue *q)
